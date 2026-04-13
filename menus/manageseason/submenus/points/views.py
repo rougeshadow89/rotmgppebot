@@ -12,9 +12,13 @@ from menus.manageseason.common import (
     build_point_settings_embed,
 )
 from menus.manageseason.modals import (
+    EditPenaltyBaseRatesModal,
     EditClassPointSettingsModal,
+    EditDuplicateItemPointsModal,
     EditGlobalPointSettingsModal,
+    EditPetModifierModal,
     EditPpeTypeMultiplierModal,
+    EditRarityModifiersModal,
 )
 from menus.manageseason.services import load_character_settings_for_menu, load_points_settings_for_menu
 from utils.ppe_types import all_ppe_types, ppe_type_label
@@ -50,7 +54,59 @@ class ManagePointSettingsView(OwnerBoundView):
         view = ManagePpeTypePointSettingsView(owner_id=self.owner_id, character_settings=character_settings)
         await interaction.response.edit_message(embed=view.current_embed(), view=view)
 
-    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Penalty Reduction Modifiers", style=discord.ButtonStyle.success, row=2)
+    async def edit_pet_modifiers(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        self.settings = await load_points_settings_for_menu(interaction)
+        await interaction.response.send_modal(
+            EditPetModifierModal(
+                owner_id=self.owner_id,
+                settings=self.settings,
+                source_message=interaction.message,
+            )
+        )
+
+    @discord.ui.button(label="Edit Penalty Base Rates", style=discord.ButtonStyle.success, row=2)
+    async def edit_penalty_base_rates(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        self.settings = await load_points_settings_for_menu(interaction)
+        await interaction.response.send_modal(
+            EditPenaltyBaseRatesModal(
+                owner_id=self.owner_id,
+                settings=self.settings,
+                source_message=interaction.message,
+            )
+        )
+
+    @discord.ui.button(label="Edit Duplicate Item Points", style=discord.ButtonStyle.success, row=1)
+    async def edit_duplicate_item_points(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        self.settings = await load_points_settings_for_menu(interaction)
+        await interaction.response.send_modal(
+            EditDuplicateItemPointsModal(
+                owner_id=self.owner_id,
+                settings=self.settings,
+                source_message=interaction.message,
+            )
+        )
+
+    @discord.ui.button(label="Edit Rarity Modifiers", style=discord.ButtonStyle.success, row=1)
+    async def edit_rarity_modifiers(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        self.settings = await load_points_settings_for_menu(interaction)
+        await interaction.response.send_modal(
+            EditRarityModifiersModal(
+                owner_id=self.owner_id,
+                settings=self.settings,
+                source_message=interaction.message,
+            )
+        )
+
+    @discord.ui.button(label="Manage Set Completion Points", style=discord.ButtonStyle.success, row=2)
+    async def manage_set_points(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        from menus.manageseason.submenus.sets.views import ManageSetPointsView
+
+        self.settings = await load_points_settings_for_menu(interaction)
+        view = ManageSetPointsView(owner_id=self.owner_id, settings=self.settings)
+        await interaction.response.edit_message(embed=view.current_embed(), view=view)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=3)
     async def back(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         from menus.manageseason.submenus.home.views import ManageSeasonHomeView
 

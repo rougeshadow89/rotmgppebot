@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from enum import Enum
 
@@ -37,8 +37,9 @@ class ROTMGClass(str, Enum):
 class Loot:
     item_name: str
     quantity: int
-    divine: bool = False
     shiny: bool = False
+    rarity: str = "common"
+    logged_times: List[int] = field(default_factory=list)
 
 @dataclass
 class Bonus:
@@ -55,6 +56,7 @@ class PPEData:
     loot: List[Loot] = field(default_factory=list)
     bonuses: List[Bonus] = field(default_factory=list)
     ppe_type: str = DEFAULT_PPE_TYPE
+    completed_sets: List[str] = field(default_factory=list)
 
 @dataclass
 class TeamData:
@@ -78,12 +80,21 @@ class PlayerData:
     ppes: List[PPEData] = field(default_factory=list)
     active_ppe: Optional[int] = None
     is_member: bool = False
-    unique_items: Set[tuple] = field(default_factory=set)  # (item_name, shiny)
+    season_item_history: Dict[str, List[int]] = field(default_factory=dict)  # seasonal item variant key -> sorted unix timestamps
     team_name: Optional[str] = None  # Name of the team this player is on (None if not on a team)
     quests: QuestData = field(default_factory=QuestData)
     quest_resets_remaining: Optional[int] = None
     
     def get_unique_item_count(self) -> int:
         """Get the count of unique items across all PPEs."""
-        return len(self.unique_items)
+        if isinstance(self.season_item_history, dict):
+            unique_base_items = {
+                (parts[0], parts[1] == "1")
+                for key in self.season_item_history.keys()
+                if isinstance(key, str)
+                for parts in [str(key).split("|")]
+                if len(parts) >= 2 and parts[0]
+            }
+            return len(unique_base_items)
+        return 0
 

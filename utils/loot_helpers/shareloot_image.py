@@ -1,3 +1,5 @@
+"""Utilities for shareloot image."""
+
 import csv
 import glob
 import os
@@ -7,9 +9,11 @@ import discord
 from PIL import Image
 
 from utils.calc_points import normalize_item_name
+from utils.image_utils import overlay_rarity_badge_on_image
+from utils.loot_constants import rarity_rank
 
 
-LootSourceItems = Sequence[tuple[str, bool]]
+LootSourceItems = Sequence[tuple[str, bool] | tuple[str, bool, str]]
 
 _LOOTSUMMARY_DIR = os.path.join("helper_pics", "lootsummary_pics")
 _DUNGEONS_PATH = os.path.join("helper_pics", "dungeon_pics")
@@ -74,12 +78,16 @@ def _is_in_variant(item_type: str, variant: str) -> bool:
     return True
 
 
+def _lookup_key(name: str) -> str:
+    return normalize_item_name(name).casefold()
+
+
 def _load_sprite_positions(sprite_csv: str) -> dict[str, dict[str, int]]:
     sprite_positions: dict[str, dict[str, int]] = {}
     with open(sprite_csv, "r", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            normalized_name = normalize_item_name(row["item_name"])
+            normalized_name = _lookup_key(row["item_name"])
             sprite_positions[normalized_name] = {
                 "pixel_x": int(row["pixel_x"]),
                 "pixel_y": int(row["pixel_y"]),
@@ -92,7 +100,7 @@ def _load_item_type_lookup() -> dict[str, str]:
     with open("rotmg_loot_drops_updated.csv", "r", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            normalized_name = normalize_item_name(row["Item Name"])
+            normalized_name = _lookup_key(row["Item Name"])
             item_type_lookup[normalized_name] = row["Loot Type"].strip().lower()
     return item_type_lookup
 
@@ -112,7 +120,7 @@ def _load_sprite_images() -> dict[str, Image.Image]:
         if any(part in ignored_folders for part in folder_parts):
             continue
 
-        item_name = normalize_item_name(os.path.splitext(os.path.basename(png_file))[0])
+        item_name = _lookup_key(os.path.splitext(os.path.basename(png_file))[0])
         try:
             img = Image.open(png_file)
             if img.mode != "RGBA":
@@ -129,6 +137,31 @@ def _load_sprite_images() -> dict[str, Image.Image]:
 def _safe_username(display_name: str) -> str:
     username = display_name.replace(" ", "_")
     return "".join(c for c in username if c.isalnum() or c in "_-")
+
+
+def _collapse_to_highest_rarity(source_items: LootSourceItems) -> list[tuple[str, str, bool, str]]:
+    # Key by normalized item name + shiny and keep the highest rarity only.
+    collapsed: dict[tuple[str, bool], tuple[str, str, bool, str]] = {}
+
+    for entry in source_items:
+        raw_name = str(entry[0]).strip()
+        shiny = bool(entry[1])
+        rarity = str(entry[2]).strip().lower() if len(entry) > 2 else "common"
+        normalized_name = _lookup_key(raw_name)
+        if not normalized_name:
+            continue
+
+        key = (normalized_name, shiny)
+        existing = collapsed.get(key)
+        if existing is None:
+            collapsed[key] = (raw_name, normalized_name, shiny, rarity)
+            continue
+
+        if rarity_rank(rarity) > rarity_rank(existing[3]):
+            # Keep first seen display name if possible, replace only rarity.
+            collapsed[key] = (existing[0], normalized_name, shiny, rarity)
+
+    return list(collapsed.values())
 
 
 async def generate_loot_share_image(
@@ -166,12 +199,12 @@ async def generate_loot_share_image(
     total_variant_items = 0
     items_excluded_from_variant: list[str] = []
 
-    normalized_items: list[tuple[str, str, bool, str]] = []
-    for raw_name, shiny in source_items:
-        normalized_name = normalize_item_name(raw_name)
+    collapsed_items = _collapse_to_highest_rarity(source_items)
+    normalized_items: list[tuple[str, str, bool, str, str]] = []
+    for raw_name, normalized_name, shiny, rarity in collapsed_items:
         display_name = f"{raw_name} (shiny)" if shiny else raw_name
         item_type = item_type_lookup.get(normalized_name, "")
-        normalized_items.append((raw_name, normalized_name, shiny, item_type))
+        normalized_items.append((raw_name, normalized_name, shiny, item_type, rarity))
 
         if _is_in_variant(item_type, variant):
             total_variant_items += 1
@@ -192,29 +225,27 @@ async def generate_loot_share_image(
         items_placed = 0
         items_not_found: list[str] = []
 
-        for raw_name, normalized_name, shiny, item_type in normalized_items:
+        render_candidates: dict[str, tuple[str, str, bool, str]] = {}
+        for raw_name, normalized_name, shiny, item_type, rarity in normalized_items:
             if not _is_in_variant(item_type, variant):
                 continue
 
+            sprite_key = f"{normalized_name} (shiny)" if shiny else normalized_name
+            existing = render_candidates.get(sprite_key)
+            if existing is None or rarity_rank(rarity) > rarity_rank(existing[3]):
+                render_candidates[sprite_key] = (raw_name, normalized_name, shiny, rarity)
+
+        for sprite_key, (raw_name, normalized_name, shiny, rarity) in render_candidates.items():
             display_name = f"{raw_name} (shiny)" if shiny else raw_name
 
-            if shiny:
-                shiny_name = f"{normalized_name} (shiny)"
-                if shiny_name in sprite_positions and shiny_name in sprite_images:
-                    pos = sprite_positions[shiny_name]
-                    sprite = sprite_images[shiny_name]
-                    background.paste(sprite, (pos["pixel_x"], pos["pixel_y"]), sprite)
-                    items_placed += 1
-                else:
-                    items_not_found.append(display_name)
+            if sprite_key in sprite_positions and sprite_key in sprite_images:
+                pos = sprite_positions[sprite_key]
+                sprite = sprite_images[sprite_key]
+                sprite = overlay_rarity_badge_on_image(sprite, rarity) or sprite
+                background.paste(sprite, (pos["pixel_x"], pos["pixel_y"]), sprite)
+                items_placed += 1
             else:
-                if normalized_name in sprite_positions and normalized_name in sprite_images:
-                    pos = sprite_positions[normalized_name]
-                    sprite = sprite_images[normalized_name]
-                    background.paste(sprite, (pos["pixel_x"], pos["pixel_y"]), sprite)
-                    items_placed += 1
-                else:
-                    items_not_found.append(display_name)
+                items_not_found.append(display_name)
 
         safe_username = _safe_username(interaction.user.display_name)
         filename = f"{safe_username}_{filename_suffix}.png"
@@ -230,7 +261,7 @@ async def generate_loot_share_image(
         if variant == "all":
             summary_lines = [
                 f"**Items Placed:** {items_placed}",
-                f"**{total_items_label}:** {len(source_items)}",
+                f"**{total_items_label}:** {len(normalized_items)}",
             ]
             if all_variant_extra_lines:
                 summary_lines.extend(all_variant_extra_lines)

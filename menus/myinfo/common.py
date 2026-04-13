@@ -10,11 +10,13 @@ from dataclass import PPEData, PlayerData
 from menus.menu_utils import SafeResponse
 from utils.ppe_types import normalize_ppe_type, ppe_type_label, ppe_type_short_label
 from utils.guild_config import get_realmshark_settings, load_guild_config
-from utils.helpers.loot_share_commands import share_active_ppe_loot_image
-from utils.loot_table_md_builder import create_loot_markdown_file, create_season_loot_markdown_file
-from utils.ppe_list_md_builder import create_ppe_list_markdown_file
-from utils.points_service import penalty_inputs_from_bonuses
+from utils.loot_helpers.loot_share_commands import share_active_ppe_loot_image
+from utils.message_utils.loot_table_md_builder import create_loot_markdown_file, create_season_loot_markdown_file
+from utils.message_utils.ppe_list_md_builder import create_ppe_list_markdown_file
+from utils.points_service import format_starting_penalty_line, penalty_inputs_from_bonuses, starting_penalty_breakdown_from_inputs
+from utils.points_service import loot_adjustments_for_ppe, recompute_ppe_points
 from utils.player_records import ensure_player_exists, load_player_records, save_player_records
+from utils.season_loot_history import iter_season_variants, unique_season_item_count
 
 
 async def send_interaction_text(interaction: discord.Interaction, content: str, *, ephemeral: bool) -> None:
@@ -58,18 +60,51 @@ def penalty_stats_text(ppe: PPEData, guild_config: dict | None = None) -> str:
     """Convert stored penalty bonuses into user-friendly stat values."""
 
     defaults = penalty_input_defaults(ppe, guild_config)
+    breakdown = starting_penalty_breakdown_from_inputs(
+        int(defaults["pet_level"]),
+        int(defaults["num_exalts"]),
+        float(defaults["percent_loot"]),
+        float(defaults["incombat_reduction"]),
+        guild_config=guild_config,
+    )
+
+    def _line(label: str, value_text: str, details: dict[str, float]) -> str:
+        return format_starting_penalty_line(label, value_text, details)
 
     return (
-        f"Pet Level: **{int(defaults['pet_level'])}**\n"
-        f"Exalts: **{int(defaults['num_exalts'])}**\n"
-        f"Loot Boost: **{float(defaults['percent_loot']):g}%**\n"
-        f"In-Combat Reduction: **{float(defaults['incombat_reduction']):g}s**"
+        _line("Pet Level", str(int(defaults["pet_level"])), breakdown["Pet Level Penalty"])
+        + "\n"
+        + _line("Exalts", str(int(defaults["num_exalts"])), breakdown["Exalts Penalty"])
+        + "\n"
+        + _line("Loot Boost", f"{float(defaults['percent_loot']):g}%", breakdown["Loot Boost Penalty"])
+        + "\n"
+        + _line(
+            "In-Combat Reduction",
+            f"{float(defaults['incombat_reduction']):g}s",
+            breakdown["In-Combat Reduction Penalty"],
+        )
     )
 
 
 def penalty_input_defaults(ppe: PPEData, guild_config: dict | None = None) -> dict[str, float]:
     """Return editable penalty form defaults derived from stored penalty bonuses."""
     return penalty_inputs_from_bonuses(ppe.bonuses, guild_config=guild_config)
+
+
+def loot_adjustments_text(ppe: PPEData, guild_config: dict | None = None) -> str:
+    defaults = penalty_input_defaults(ppe, guild_config)
+    adjustments = loot_adjustments_for_ppe(ppe, guild_config)
+    combined_multiplier = float(adjustments["combined_item_multiplier"])
+    
+    return (
+        f"Pet: {int(defaults['pet_level'])} -> -{float(adjustments['pet_reduction_percent']):.2f}%\n"
+        f"Exalts: {int(defaults['num_exalts'])} -> -{float(adjustments['exalts_reduction_percent']):.2f}%\n"
+        f"Loot Boost: {float(defaults['percent_loot']):g}% -> -{float(adjustments['loot_reduction_percent']):.2f}%\n"
+        f"In-Combat: {float(defaults['incombat_reduction']):g}s -> -{float(adjustments['incombat_reduction_percent']):.2f}%\n"
+        f"Stat Reduction: **-{float(adjustments['total_reduction_percent']):.2f}%** ({float(adjustments['reduction_multiplier']):.2f}x)\n"
+        f"Type Multiplier: **{float(adjustments['type_multiplier']):.2f}x**\n"
+        f"Combined Multiplier: **{combined_multiplier:.2f}x**"
+    )
 
 
 def build_home_embed(
@@ -105,7 +140,7 @@ def build_home_embed(
     team_name = player_data.team_name or "N/A"
     embed.add_field(name="Number of PPEs", value=f"**{len(player_data.ppes)}/{max_ppes}**", inline=True)
     embed.add_field(name="Best PPE", value=best_line, inline=True)
-    embed.add_field(name="Number of Season Items", value=f"**{len(player_data.unique_items)}**", inline=True)
+    embed.add_field(name="Number of Season Items", value=f"**{unique_season_item_count(player_data)}**", inline=True)
     embed.add_field(name="Team", value=f"**{team_name}**", inline=True)
     embed.add_field(name="Current Active PPE", value=active_line, inline=False)
 
@@ -159,6 +194,7 @@ def build_character_embed(
     embed.add_field(name="RealmShark Connected", value="Yes" if is_realmshark_connected else "No", inline=True)
     embed.add_field(name="Different Loot Items", value=str(distinct_loot_items), inline=True)
     embed.add_field(name="Starting Penalty Stats", value=penalty_stats_text(ppe, guild_config), inline=False)
+    embed.add_field(name="Loot Adjustments", value=loot_adjustments_text(ppe, guild_config), inline=False)
     embed.add_field(name="Character Type", value=character_type, inline=True)
     embed.add_field(name="Active Status", value="⭐ Active PPE" if is_active else "Not Active", inline=True)
 
@@ -207,9 +243,9 @@ async def send_season_loot_markdown_followup(interaction: discord.Interaction) -
         return
 
     player_data = records[key]
-    items_list = sorted(player_data.unique_items, key=lambda x: (x[0].lower(), x[1]))
+    season_variants = iter_season_variants(player_data)
 
-    if not items_list:
+    if not season_variants:
         await interaction.followup.send(
             "You haven't collected any season loot yet!\nUse `/addseasonloot` to start tracking your unique items.",
             ephemeral=True,
@@ -217,7 +253,7 @@ async def send_season_loot_markdown_followup(interaction: discord.Interaction) -
         return
 
     temp_file_path = create_season_loot_markdown_file(
-        player_data.unique_items,
+        player_data.season_item_history,
         display_name=interaction.user.display_name,
     )
 
@@ -284,9 +320,22 @@ async def temporarily_switch_active_ppe_and_share(
 
 
 async def refresh_player_data(interaction: discord.Interaction, user_id: int) -> PlayerData:
+    guild_config = await load_guild_config(interaction)
     records = await load_player_records(interaction)
     key = ensure_player_exists(records, user_id)
-    return records[key]
+    player_data = records[key]
+
+    changed = False
+    for ppe in player_data.ppes:
+        previous_points = round(float(ppe.points), 2)
+        breakdown = recompute_ppe_points(ppe, guild_config)
+        if round(float(breakdown.get("total", ppe.points)), 2) != previous_points:
+            changed = True
+
+    if changed:
+        await save_player_records(interaction, records)
+
+    return player_data
 
 
 def find_ppe_or_raise(player_data: PlayerData, ppe_id: int) -> PPEData:

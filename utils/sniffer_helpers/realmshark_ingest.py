@@ -1,3 +1,5 @@
+"""Utilities for realmshark ingest."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,13 +11,14 @@ import re
 from typing import Any, Awaitable, Callable, Dict
 
 from dataclass import PlayerData
-from utils.calc_points import calc_points, load_loot_points, normalize_item_name
-from utils.guild_config import get_quest_targets, get_realmshark_settings_by_id, load_guild_config, set_realmshark_settings_by_id
+from utils.calc_points import load_loot_points, normalize_item_name
+from utils.guild_config import get_realmshark_settings_by_id, set_realmshark_settings_by_id
 from utils.loot_data import LOOT
-from utils.player_manager import player_manager
-from utils.player_records import ensure_player_exists, load_player_records, save_player_records
-from utils.quest_manager import update_quests_for_item
-from utils.realmshark_pending_store import append_pending_event, migrate_legacy_pending_map
+from utils.loot_ops import add_ppe_loot, add_season_loot
+from utils.player_records import ensure_player_exists, load_player_records, highest_rarity
+from utils.sniffer_helpers.realmshark_pending_store import append_pending_event, migrate_legacy_pending_map
+from utils.item_log_timestamps import seasonal_item_key
+from utils.season_loot_history import normalize_rarity, unique_season_item_count
 
 
 class IngestValidationError(Exception):
@@ -61,9 +64,6 @@ Notifier = Callable[
     ],
     Awaitable[None],
 ]
-_ALLOWED_RARITIES = {"common", "uncommon", "rare", "legendary", "divine"}
-
-
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -174,20 +174,6 @@ def _as_bool(value: Any) -> bool:
     return normalized in {"1", "true", "yes", "on"}
 
 
-def _normalize_rarity(value: Any) -> str:
-    if value is None:
-        return "rare"
-
-    raw = str(value).strip().lower()
-    if not raw:
-        return "rare"
-
-    if raw in _ALLOWED_RARITIES:
-        return raw
-
-    return "rare"
-
-
 def _parse_positive_int(value: Any) -> int | None:
     try:
         parsed = int(value)
@@ -237,7 +223,7 @@ def _normalized_seasonal_character_ids(link_data: Dict[str, Any]) -> set[str]:
 
 
 def _display_rarity(rarity: str) -> str:
-    normalized = _normalize_rarity(rarity)
+    normalized = normalize_rarity(rarity)
     return normalized[:1].upper() + normalized[1:]
 
 
@@ -310,7 +296,7 @@ def _validate_shiny_variant(item_name: str, shiny: bool) -> None:
         )
 
 
-async def _addloot_for_user(guild_id: int, user_id: int, item_name: str, divine: bool, shiny: bool) -> Dict[str, Any]:
+async def _addloot_for_user(guild_id: int, user_id: int, item_name: str, shiny: bool, rarity: str) -> Dict[str, Any]:
     interaction = _SyntheticInteraction(guild=_SyntheticGuild(guild_id), user=_SyntheticUser(user_id))
 
     records = await load_player_records(interaction)
@@ -324,20 +310,18 @@ async def _addloot_for_user(guild_id: int, user_id: int, item_name: str, divine:
     if ppe_id is None:
         raise IngestValidationError("Linked user does not have an active PPE.", status_code=409, error_code="no_active_ppe")
 
-    return await _addloot_for_user_with_ppe(guild_id, user_id, item_name, divine, shiny, int(ppe_id))
+    return await _addloot_for_user_with_ppe(guild_id, user_id, item_name, shiny, rarity, int(ppe_id))
 
 
 async def _addloot_for_user_with_ppe(
     guild_id: int,
     user_id: int,
     item_name: str,
-    divine: bool,
     shiny: bool,
+    rarity: str,
     ppe_id: int,
 ) -> Dict[str, Any]:
     interaction = _SyntheticInteraction(guild=_SyntheticGuild(guild_id), user=_SyntheticUser(user_id))
-
-    points = calc_points(item_name, divine, shiny)
     records = await load_player_records(interaction)
     key = ensure_player_exists(records, user_id)
     player_data = records.get(key)
@@ -353,67 +337,49 @@ async def _addloot_for_user_with_ppe(
             error_code="invalid_target_ppe",
         )
 
-    item_key, points_added, active_ppe, _quest_update = await player_manager.add_loot_and_points(
-        interaction,
-        user=_SyntheticUser(user_id),
-        ppe_id=int(ppe_id),
-        item_name=item_name,
-        divine=divine,
-        shiny=shiny,
-        points=points,
-    )
+    try:
+        result = await add_ppe_loot(
+            interaction,
+            user=_SyntheticUser(user_id),
+            ppe_id=int(ppe_id),
+            item_name=item_name,
+            shiny=shiny,
+            rarity=rarity,
+        )
+    except (ValueError, KeyError, LookupError) as e:
+        raise IngestValidationError(str(e), status_code=409, error_code="addloot_failed") from e
 
     return {
         "mode": "addloot",
-        "item": item_key,
-        "points_added": points_added,
-        "total_points": active_ppe.points,
-        "ppe_id": active_ppe.id,
+        "item": result.item_name,
+        "points_added": result.points_delta,
+        "total_points": result.new_points,
+        "ppe_id": result.ppe.id,
     }
 
 
-async def _addseasonloot_for_user(guild_id: int, user_id: int, item_name: str, shiny: bool) -> Dict[str, Any]:
+async def _addseasonloot_for_user(guild_id: int, user_id: int, item_name: str, shiny: bool, rarity: str) -> Dict[str, Any]:
     interaction = _SyntheticInteraction(guild=_SyntheticGuild(guild_id), user=_SyntheticUser(user_id))
 
-    records = await load_player_records(interaction)
-    key = ensure_player_exists(records, user_id)
-
-    player_data: PlayerData | None = records.get(key)
-    if player_data is None or not player_data.is_member:
-        raise IngestValidationError("Linked user is not part of the PPE contest.", status_code=403, error_code="not_member")
-
-    item_key = (item_name, shiny)
-    if item_key in player_data.unique_items:
-        raise IngestValidationError(
-            f"'{item_name}{' (shiny)' if shiny else ''}' is already in season loot.",
-            status_code=409,
-            error_code="duplicate_season_item",
+    try:
+        result = await add_season_loot(
+            interaction,
+            user_id=user_id,
+            username=f"User {user_id}",
+            item_name=item_name,
+            shiny=shiny,
+            rarity=normalize_rarity(rarity),
         )
-
-    player_data.unique_items.add(item_key)
-    regular_target, shiny_target, skin_target = await get_quest_targets(interaction)
-    config = await load_guild_config(interaction)
-    update_quests_for_item(
-        player_data,
-        item_name,
-        shiny,
-        target_item_quests=regular_target,
-        target_shiny_quests=shiny_target,
-        target_skin_quests=skin_target,
-        global_quests={
-            "enabled": bool(config["quest_settings"].get("use_global_quests", False)),
-            "regular": list(config["quest_settings"].get("global_regular_quests", [])),
-            "shiny": list(config["quest_settings"].get("global_shiny_quests", [])),
-            "skin": list(config["quest_settings"].get("global_skin_quests", [])),
-        },
-    )
-
-    await save_player_records(interaction, records)
+    except KeyError as e:
+        raise IngestValidationError(str(e), status_code=403, error_code="not_member") from e
+    except (ValueError, LookupError) as e:
+        raise IngestValidationError(str(e), status_code=409, error_code="addseasonloot_failed") from e
 
     return {
         "mode": "addseasonloot",
         "item": f"{item_name}{' (shiny)' if shiny else ''}",
-        "season_unique_total": player_data.get_unique_item_count(),
+        "season_unique_total": result.new_unique_total,
+        "already_present": result.already_present,
     }
 
 
@@ -424,7 +390,7 @@ async def _get_season_unique_total_for_user(guild_id: int, user_id: int) -> int:
     player_data: PlayerData | None = records.get(key)
     if player_data is None:
         return 0
-    return player_data.get_unique_item_count()
+    return unique_season_item_count(player_data)
 
 
 async def _addseasonloot_with_duplicate_ok(
@@ -432,24 +398,9 @@ async def _addseasonloot_with_duplicate_ok(
     user_id: int,
     item_name: str,
     shiny: bool,
+    rarity: str,
 ) -> Dict[str, Any]:
-    try:
-        result = await _addseasonloot_for_user(guild_id, user_id, item_name, shiny)
-        result["already_present"] = False
-        return result
-    except IngestValidationError as e:
-        if e.error_code != "duplicate_season_item":
-            raise
-
-        total = await _get_season_unique_total_for_user(guild_id, user_id)
-        return {
-            "mode": "addseasonloot",
-            "item": f"{item_name}{' (shiny)' if shiny else ''}",
-            "season_unique_total": total,
-            "already_present": True,
-            "logged": False,
-            "reason": "duplicate_season_item",
-        }
+    return await _addseasonloot_for_user(guild_id, user_id, item_name, shiny, rarity)
 
 
 async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None = None) -> Dict[str, Any]:
@@ -472,7 +423,9 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
     raw_item_name = str(payload.get("item_name", "")).strip()
     divine = _as_bool(payload.get("divine", False))
     shiny = _as_bool(payload.get("shiny", False))
-    item_rarity = _normalize_rarity(payload.get("item_rarity", "rare"))
+    item_rarity = normalize_rarity(payload.get("item_rarity", "common"))
+    if divine and item_rarity == "common":
+        item_rarity = "divine"
 
     normalized_item_name, suffix_shiny = _strip_shiny_suffix(raw_item_name)
     if suffix_shiny and not shiny:
@@ -640,7 +593,7 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
                 f"Character_id={character_id} explicitly mapped to seasonal. "
                 f"Routing to addseasonloot guild_id={guild_id} user_id={linked_user_id}"
             )
-            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny)
+            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny, item_rarity)
         elif bound_ppe_id is not None:
             try:
                 mode = "addloot"
@@ -655,8 +608,8 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
                     guild_id,
                     linked_user_id,
                     item_name,
-                    divine,
                     shiny,
+                    item_rarity,
                     bound_ppe_id,
                 )
             except IngestValidationError as e:
@@ -666,7 +619,7 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
                 )
                 mode = "addseasonloot"
                 routing_reason = "mapped_character_fallback_to_season"
-                result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny)
+                result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny, item_rarity)
         else:
             mode = "addseasonloot"
             routing_reason = "unmapped_character"
@@ -674,14 +627,14 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
                 f"Unmapped character_id={character_id}; routing to addseasonloot "
                 f"guild_id={guild_id} user_id={linked_user_id}"
             )
-            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny)
+            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny, item_rarity)
 
             is_first_unmapped = await append_pending_event(
                 guild_id,
                 linked_user_id,
                 character_id=character_id,
                 item_name=item_name,
-                item_rarity=_normalize_rarity(item_rarity),
+                item_rarity=normalize_rarity(item_rarity),
                 shiny=shiny,
                 divine=divine,
                 character_name=character_name,
@@ -723,17 +676,17 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
                 f"Invalid character_id received; forcing addseasonloot guild_id={guild_id} "
                 f"user_id={linked_user_id} raw_character_id={raw_character_id!r}"
             )
-            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny)
+            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny, item_rarity)
         elif mode == "addseasonloot":
             _debug_log(
                 f"Dispatching loot event using legacy mode={mode} guild_id={guild_id} user_id={linked_user_id}"
             )
-            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny)
+            result = await _addseasonloot_with_duplicate_ok(guild_id, linked_user_id, item_name, shiny, item_rarity)
         else:
             _debug_log(
                 f"Dispatching loot event using legacy mode={mode} guild_id={guild_id} user_id={linked_user_id}"
             )
-            result = await _addloot_for_user(guild_id, linked_user_id, item_name, divine, shiny)
+            result = await _addloot_for_user(guild_id, linked_user_id, item_name, shiny, item_rarity)
 
     _debug_log(
         f"Logged item via mode={mode} guild_id={guild_id} user_id={linked_user_id} item='{item_name}'"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 
 import discord
@@ -15,18 +16,24 @@ from utils.guild_config import (
     get_points_settings,
     get_realmshark_settings,
     load_guild_config,
+    save_guild_config,
     set_contest_settings,
     set_max_ppes,
     set_ppe_settings,
     set_points_settings,
     set_realmshark_settings,
     update_global_points_modifiers,
+    update_starting_penalty_modifiers,
 )
 from utils.player_records import load_player_records, load_teams, save_player_records, save_teams
 from utils.points_service import recompute_ppe_points
-from utils.realmshark_pending_store import clear_all_pending_for_guild
+from utils.sniffer_helpers.realmshark_pending_store import clear_all_pending_for_guild
 from utils.contest_leaderboards import normalize_contest_leaderboard_id
-from utils.realmshark_cleanup import clear_ppe_character_links
+from utils.sniffer_helpers.realmshark_cleanup import clear_ppe_character_links
+from utils.settings.channel_settings import (
+    clear_item_suggestions_enabled_channels,
+    set_item_suggestions_mode_enabled,
+)
 
 
 @dataclass(slots=True)
@@ -66,6 +73,120 @@ class MaxCharactersUpdateSummary:
     active_characters_deleted: int
 
 
+@dataclass(slots=True)
+class ResetPPECharactersSummary:
+    """Structured result payload for clearing all PPE characters and loot."""
+
+    players_updated: int
+    ppes_cleared: int
+
+
+@dataclass(slots=True)
+class ResetQuestsSummary:
+    """Structured result payload for clearing quest progress only."""
+
+    players_updated: int
+    quest_entries_cleared: int
+    default_reset_limit: int
+
+
+@dataclass(slots=True)
+class ResetSeasonalInfoSummary:
+    """Structured result payload for clearing seasonal-only progress state."""
+
+    players_updated: int
+    unique_items_cleared: int
+    quest_entries_cleared: int
+    default_reset_limit: int
+
+
+@dataclass(slots=True)
+class ResetTeamsSummary:
+    """Structured result payload for clearing team records and roles."""
+
+    teams_deleted: int
+    team_roles_deleted: int
+    players_unassigned: int
+
+
+@dataclass(slots=True)
+class ResetSnifferOptions:
+    """Selectable sniffer reset options for the reset submenu."""
+
+    clear_character_mappings: bool = True
+    revoke_tokens: bool = False
+    clear_pending_files: bool = True
+    clear_output_channel: bool = False
+    clear_endpoint: bool = False
+    disable_sniffer: bool = False
+
+
+@dataclass(slots=True)
+class ResetSnifferSummary:
+    """Structured result payload for configurable sniffer resets."""
+
+    links_before: int
+    links_after: int
+    tokens_revoked: int
+    character_bindings_cleared: int
+    seasonal_ids_cleared: int
+    metadata_entries_cleared: int
+    pending_files_cleared: int
+    endpoint_cleared: bool
+    output_channel_cleared: bool
+    sniffer_disabled: bool
+
+
+def _count_unique_items_from_history(season_item_history: Any) -> int:
+    if not isinstance(season_item_history, dict) or not season_item_history:
+        return 0
+    return len({
+        key.split("|")[0]
+        for key in season_item_history.keys()
+        if isinstance(key, str) and key and "|" in key and key.split("|")[0]
+    })
+
+
+@dataclass(slots=True)
+class ResetSettingsSummary:
+    """Structured result payload for resetting admin-tunable settings."""
+
+    endpoint_preserved: bool
+    join_embed_preserved: bool
+    picture_suggestion_channels_cleared: int
+
+
+@dataclass(slots=True)
+class BulkRoleUpdateSummary:
+    """Structured result payload for bulk role assignment removals."""
+
+    role_name: str
+    role_found: bool
+    members_updated: int
+    members_failed: int
+    records_cleared: int = 0
+    tokens_revoked: int = 0
+    removed_member_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class JoinEmbedResetSummary:
+    """Structured result payload for clearing join embed settings."""
+
+    join_embed_was_configured: bool
+    join_embed_message_deleted: bool
+
+
+@dataclass(slots=True)
+class RoleDeleteSummary:
+    """Structured result payload for deleting PPE and team role objects."""
+
+    ppe_roles_deleted: int
+    ppe_roles_failed: int
+    team_roles_deleted: int
+    team_roles_failed: int
+
+
 async def load_points_settings_for_menu(interaction: discord.Interaction) -> dict[str, Any]:
     """Load point settings for point-settings embeds/views."""
     settings = await get_points_settings(interaction)
@@ -82,6 +203,18 @@ async def load_contest_settings_for_menu(interaction: discord.Interaction) -> di
     """Load contest settings for manage-contests embeds/views."""
     settings = await get_contest_settings(interaction)
     return dict(settings)
+
+
+async def _update_contest_bool_setting(
+    interaction: discord.Interaction,
+    *,
+    setting_key: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    settings = await get_contest_settings(interaction)
+    settings[setting_key] = bool(enabled)
+    saved = await set_contest_settings(interaction, settings)
+    return dict(saved)
 
 
 async def update_default_contest_leaderboard(
@@ -103,10 +236,50 @@ async def update_team_contest_quest_points_setting(
     enabled: bool,
 ) -> dict[str, Any]:
     """Toggle whether team contests should include quest points."""
-    settings = await get_contest_settings(interaction)
-    settings["team_contest_include_quest_points"] = bool(enabled)
-    saved = await set_contest_settings(interaction, settings)
-    return dict(saved)
+    return await _update_contest_bool_setting(
+        interaction,
+        setting_key="team_contest_include_quest_points",
+        enabled=enabled,
+    )
+
+
+async def update_ppe_contest_quest_points_setting(
+    interaction: discord.Interaction,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Toggle whether PPE contest leaderboard should include quest points."""
+    return await _update_contest_bool_setting(
+        interaction,
+        setting_key="ppe_contest_include_quest_points",
+        enabled=enabled,
+    )
+
+
+async def update_ppe_aggregate_points_setting(
+    interaction: discord.Interaction,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Toggle whether PPE leaderboard scores should aggregate all characters."""
+    return await _update_contest_bool_setting(
+        interaction,
+        setting_key="ppe_aggregate_points_enabled",
+        enabled=enabled,
+    )
+
+
+async def update_team_aggregate_points_setting(
+    interaction: discord.Interaction,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Toggle whether team contest scores should aggregate all team characters."""
+    return await _update_contest_bool_setting(
+        interaction,
+        setting_key="team_aggregate_points_enabled",
+        enabled=enabled,
+    )
 
 
 def _build_join_contest_embed(*, role: discord.Role, emoji: str) -> discord.Embed:
@@ -216,17 +389,6 @@ def _ppe_sort_key_lowest_points(ppe: Any) -> tuple[float, int]:
     return (points_value, ppe_id)
 
 
-def _rebuild_unique_items(player_data: Any) -> None:
-    unique_items: set[tuple[str, bool]] = set()
-    for ppe in getattr(player_data, "ppes", []):
-        for loot_item in getattr(ppe, "loot", []):
-            name = str(getattr(loot_item, "item_name", "")).strip()
-            if not name:
-                continue
-            unique_items.add((name, bool(getattr(loot_item, "shiny", False))))
-    player_data.unique_items = unique_items
-
-
 async def update_max_characters_limit(
     interaction: discord.Interaction,
     *,
@@ -278,8 +440,6 @@ async def update_max_characters_limit(
                     player_data.active_ppe = int(getattr(replacement, "id", 0))
                 else:
                     player_data.active_ppe = None
-
-            _rebuild_unique_items(player_data)
 
             for removed_ppe_id in sorted(remove_ids):
                 await clear_ppe_character_links(interaction, int(user_id), int(removed_ppe_id))
@@ -368,6 +528,150 @@ async def update_global_point_modifiers(
     return dict(settings), refresh_summary
 
 
+async def update_pet_point_modifiers(
+    interaction: discord.Interaction,
+    *,
+    pet_level_percent_reduction: float | None = None,
+    exalts_percent_reduction: float | None = None,
+    loot_percent_reduction: float | None = None,
+    incombat_percent_reduction: float | None = None,
+    pet_points_per_level: float | None = None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    """Update starting penalty reductions and refresh all PPE totals."""
+    settings = await update_starting_penalty_modifiers(
+        interaction,
+        pet_level_percent_reduction=pet_level_percent_reduction,
+        exalts_percent_reduction=exalts_percent_reduction,
+        loot_percent_reduction=loot_percent_reduction,
+        incombat_percent_reduction=incombat_percent_reduction,
+    )
+
+    if pet_points_per_level is not None:
+        safe_points = abs(float(pet_points_per_level))
+        if safe_points <= 0:
+            raise ValueError("Pet starting points-per-level must be non-zero.")
+
+        penalty_weights = (
+            dict(settings.get("penalty_weights", {}))
+            if isinstance(settings.get("penalty_weights"), dict)
+            else {}
+        )
+        penalty_weights["pet_level_per_point"] = 1.0 / safe_points
+        settings["penalty_weights"] = penalty_weights
+        settings = await set_points_settings(interaction, settings)
+
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config={"points_settings": settings},
+    )
+    return dict(settings), refresh_summary
+
+
+async def update_penalty_base_rates(
+    interaction: discord.Interaction,
+    *,
+    pet_points_per_level: float | None = None,
+    exalts_points_per_exalt: float | None = None,
+    loot_points_per_percent: float | None = None,
+    incombat_points_per_second: float | None = None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    """Update penalty base-rate weights and refresh all PPE totals."""
+    settings = await get_points_settings(interaction)
+    penalty_weights = (
+        dict(settings.get("penalty_weights", {}))
+        if isinstance(settings.get("penalty_weights"), dict)
+        else {}
+    )
+
+    if pet_points_per_level is not None:
+        safe_points = abs(float(pet_points_per_level))
+        if safe_points <= 0:
+            raise ValueError("Pet level rate must be non-zero.")
+        penalty_weights["pet_level_per_point"] = 1.0 / safe_points
+
+    if exalts_points_per_exalt is not None:
+        safe_points = abs(float(exalts_points_per_exalt))
+        if safe_points <= 0:
+            raise ValueError("Exalts rate must be non-zero.")
+        penalty_weights["exalts_per_point"] = 1.0 / safe_points
+
+    if loot_points_per_percent is not None:
+        safe_points = abs(float(loot_points_per_percent))
+        if safe_points <= 0:
+            raise ValueError("Loot boost rate must be non-zero.")
+        penalty_weights["loot_percent_per_point"] = 1.0 / safe_points
+
+    if incombat_points_per_second is not None:
+        safe_points = abs(float(incombat_points_per_second))
+        if safe_points <= 0:
+            raise ValueError("In-combat rate must be non-zero.")
+        penalty_weights["incombat_seconds_per_point"] = 1.0 / safe_points
+
+    settings["penalty_weights"] = penalty_weights
+    settings = await set_points_settings(interaction, settings)
+
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config={"points_settings": settings},
+    )
+    return dict(settings), refresh_summary
+
+
+async def update_duplicate_item_point_reduction(
+    interaction: discord.Interaction,
+    *,
+    duplicate_point_reduction: float,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    """Update duplicate item reduction multiplier and refresh all PPE totals."""
+    settings = await update_global_points_modifiers(
+        interaction,
+        duplicate_point_reduction=max(0.0, float(duplicate_point_reduction)),
+    )
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config={"points_settings": settings},
+    )
+    return dict(settings), refresh_summary
+
+
+async def update_rarity_multipliers(
+    interaction: discord.Interaction,
+    *,
+    common: float | None = None,
+    uncommon: float | None = None,
+    rare: float | None = None,
+    legendary: float | None = None,
+    divine: float | None = None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    """Update rarity multipliers and refresh all PPE totals."""
+    settings = await get_points_settings(interaction)
+    rarity_multipliers = (
+        dict(settings.get("rarity_multipliers", {}))
+        if isinstance(settings.get("rarity_multipliers"), dict)
+        else {}
+    )
+
+    updates = {
+        "common": common,
+        "uncommon": uncommon,
+        "rare": rare,
+        "legendary": legendary,
+        "divine": divine,
+    }
+    for rarity, value in updates.items():
+        if value is None:
+            continue
+        rarity_multipliers[rarity] = max(0.0, float(value))
+
+    settings["rarity_multipliers"] = rarity_multipliers
+    settings = await set_points_settings(interaction, settings)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config={"points_settings": settings},
+    )
+    return dict(settings), refresh_summary
+
+
 async def update_class_point_override(
     interaction: discord.Interaction,
     *,
@@ -423,7 +727,12 @@ async def refresh_all_character_points(
 ) -> PointsRefreshSummary:
     """Recompute point totals for every PPE using current guild settings."""
     records = await load_player_records(interaction)
-    effective_guild_config = guild_config if isinstance(guild_config, dict) else await load_guild_config(interaction)
+    if isinstance(guild_config, dict):
+        base_config = await load_guild_config(interaction)
+        effective_guild_config = dict(base_config)
+        effective_guild_config.update(guild_config)
+    else:
+        effective_guild_config = await load_guild_config(interaction)
 
     ppes_processed = 0
     ppes_updated = 0
@@ -439,6 +748,512 @@ async def refresh_all_character_points(
     return PointsRefreshSummary(ppes_processed=ppes_processed, ppes_updated=ppes_updated)
 
 
+def _iter_player_quest_fields() -> tuple[str, ...]:
+    return (
+        "current_items",
+        "current_shinies",
+        "current_skins",
+        "completed_items",
+        "completed_shinies",
+        "completed_skins",
+    )
+
+
+def _collect_team_names_from_records(records: dict[int, Any]) -> set[str]:
+    team_names: set[str] = set()
+    for player_data in records.values():
+        team_name = getattr(player_data, "team_name", None)
+        if isinstance(team_name, str) and team_name.strip():
+            team_names.add(team_name.strip())
+    return team_names
+
+
+def _clear_team_quest_mode_state(config: dict[str, Any], *, disable_team_mode: bool = False) -> bool:
+    quest_settings = config.get("quest_settings", {}) if isinstance(config.get("quest_settings", {}), dict) else {}
+    changed = False
+
+    if quest_settings.get("team_quests_state") != {}:
+        quest_settings["team_quests_state"] = {}
+        changed = True
+
+    if disable_team_mode and bool(quest_settings.get("enable_team_quests", False)):
+        quest_settings["enable_team_quests"] = False
+        changed = True
+
+    if changed:
+        config["quest_settings"] = quest_settings
+    return changed
+
+
+async def reset_all_ppe_characters(interaction: discord.Interaction) -> ResetPPECharactersSummary:
+    """Reset all character records while preserving seasonal and quest progress."""
+    records = await load_player_records(interaction)
+
+    players_updated = 0
+    ppes_cleared = 0
+
+    for player_data in records.values():
+        player_changed = False
+
+        ppes = getattr(player_data, "ppes", [])
+        if ppes:
+            ppes_cleared += len(ppes)
+            ppes.clear()
+            player_changed = True
+
+        if getattr(player_data, "active_ppe", None) is not None:
+            player_data.active_ppe = None
+            player_changed = True
+
+        if player_changed:
+            players_updated += 1
+
+    await save_player_records(interaction, records)
+    return ResetPPECharactersSummary(
+        players_updated=players_updated,
+        ppes_cleared=ppes_cleared,
+    )
+
+
+async def reset_all_quests(interaction: discord.Interaction) -> ResetQuestsSummary:
+    """Reset quest progress and quest reset counters while preserving other seasonal data."""
+    records = await load_player_records(interaction)
+    config = await load_guild_config(interaction)
+    default_reset_limit = int(config["quest_settings"]["num_resets"])
+    config_changed = _clear_team_quest_mode_state(config)
+
+    players_updated = 0
+    quest_entries_cleared = 0
+
+    for player_data in records.values():
+        player_changed = False
+
+        quests = getattr(player_data, "quests", None)
+        if quests is not None:
+            for field_name in _iter_player_quest_fields():
+                entries = getattr(quests, field_name, [])
+                if entries:
+                    quest_entries_cleared += len(entries)
+                    entries.clear()
+                    player_changed = True
+
+        if getattr(player_data, "quest_resets_remaining", None) != default_reset_limit:
+            player_data.quest_resets_remaining = default_reset_limit
+            player_changed = True
+
+        if player_changed:
+            players_updated += 1
+
+    await save_player_records(interaction, records)
+    if config_changed:
+        await save_guild_config(interaction, config)
+    return ResetQuestsSummary(
+        players_updated=players_updated,
+        quest_entries_cleared=quest_entries_cleared,
+        default_reset_limit=default_reset_limit,
+    )
+
+
+async def reset_all_seasonal_information(interaction: discord.Interaction) -> ResetSeasonalInfoSummary:
+    """Reset seasonal progress state for all players while preserving character records."""
+    records = await load_player_records(interaction)
+    config = await load_guild_config(interaction)
+    default_reset_limit = int(config["quest_settings"]["num_resets"])
+    config_changed = _clear_team_quest_mode_state(config)
+
+    players_updated = 0
+    unique_items_cleared = 0
+    quest_entries_cleared = 0
+
+    for player_data in records.values():
+        player_changed = False
+
+        season_item_history = getattr(player_data, "season_item_history", {})
+        if isinstance(season_item_history, dict) and season_item_history:
+            unique_items_cleared += _count_unique_items_from_history(season_item_history)
+            season_item_history.clear()
+            player_changed = True
+
+        quests = getattr(player_data, "quests", None)
+        if quests is not None:
+            for field_name in _iter_player_quest_fields():
+                entries = getattr(quests, field_name, [])
+                if entries:
+                    quest_entries_cleared += len(entries)
+                    entries.clear()
+                    player_changed = True
+
+        if getattr(player_data, "quest_resets_remaining", None) != default_reset_limit:
+            player_data.quest_resets_remaining = default_reset_limit
+            player_changed = True
+
+        if player_changed:
+            players_updated += 1
+
+    await save_player_records(interaction, records)
+    if config_changed:
+        await save_guild_config(interaction, config)
+    return ResetSeasonalInfoSummary(
+        players_updated=players_updated,
+        unique_items_cleared=unique_items_cleared,
+        quest_entries_cleared=quest_entries_cleared,
+        default_reset_limit=default_reset_limit,
+    )
+
+
+async def reset_all_teams(interaction: discord.Interaction) -> ResetTeamsSummary:
+    """Remove team records, clear player team assignment, and delete matching team roles."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    records = await load_player_records(interaction)
+    teams = await load_teams(interaction)
+    config = await load_guild_config(interaction)
+    config_changed = _clear_team_quest_mode_state(config, disable_team_mode=True)
+
+    team_names = set(teams.keys())
+    team_names.update(_collect_team_names_from_records(records))
+
+    players_unassigned = 0
+    for player_data in records.values():
+        if getattr(player_data, "team_name", None):
+            player_data.team_name = None
+            players_unassigned += 1
+
+    await save_player_records(interaction, records)
+
+    teams_deleted = len(teams)
+    teams.clear()
+    await save_teams(interaction, teams)
+    if config_changed:
+        await save_guild_config(interaction, config)
+
+    team_roles_deleted = await _delete_team_roles(interaction.guild, team_names)
+    return ResetTeamsSummary(
+        teams_deleted=teams_deleted,
+        team_roles_deleted=team_roles_deleted,
+        players_unassigned=players_unassigned,
+    )
+
+
+def _normalize_realmshark_links(settings: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw_links = settings.get("links", {})
+    if not isinstance(raw_links, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for token, link_data in raw_links.items():
+        if isinstance(token, str) and token.strip() and isinstance(link_data, dict):
+            normalized[token] = dict(link_data)
+    return normalized
+
+
+def _clear_sniffer_link_character_data(link_data: dict[str, Any]) -> tuple[int, int, int]:
+    bindings = link_data.get("character_bindings", {})
+    seasonal_ids = link_data.get("seasonal_character_ids", [])
+    metadata = link_data.get("character_metadata", {})
+
+    bindings_count = len(bindings) if isinstance(bindings, dict) else 0
+    seasonal_count = len(seasonal_ids) if isinstance(seasonal_ids, list) else 0
+    metadata_count = len(metadata) if isinstance(metadata, dict) else 0
+
+    link_data["character_bindings"] = {}
+    link_data["seasonal_character_ids"] = []
+    link_data["character_metadata"] = {}
+    link_data["last_seen_character_id"] = 0
+
+    return bindings_count, seasonal_count, metadata_count
+
+
+async def reset_sniffer_data(
+    interaction: discord.Interaction,
+    *,
+    options: ResetSnifferOptions,
+) -> ResetSnifferSummary:
+    """Apply selected sniffer reset actions without forcing a full reset."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    settings = await get_realmshark_settings(interaction)
+    links = _normalize_realmshark_links(settings)
+
+    links_before = len(links)
+    links_after = links_before
+    tokens_revoked = 0
+    character_bindings_cleared = 0
+    seasonal_ids_cleared = 0
+    metadata_entries_cleared = 0
+
+    if options.revoke_tokens:
+        tokens_revoked = links_before
+        links_after = 0
+        links = {}
+    elif options.clear_character_mappings:
+        for link_data in links.values():
+            bindings_count, seasonal_count, metadata_count = _clear_sniffer_link_character_data(link_data)
+            character_bindings_cleared += bindings_count
+            seasonal_ids_cleared += seasonal_count
+            metadata_entries_cleared += metadata_count
+
+    settings["links"] = links
+    if options.clear_output_channel:
+        settings["announce_channel_id"] = 0
+    if options.clear_endpoint:
+        settings["endpoint"] = ""
+    if options.disable_sniffer:
+        settings["enabled"] = False
+
+    await set_realmshark_settings(interaction, settings)
+
+    pending_files_cleared = 0
+    if options.clear_pending_files:
+        pending_files_cleared = await clear_all_pending_for_guild(interaction.guild.id)
+
+    return ResetSnifferSummary(
+        links_before=links_before,
+        links_after=links_after,
+        tokens_revoked=tokens_revoked,
+        character_bindings_cleared=character_bindings_cleared,
+        seasonal_ids_cleared=seasonal_ids_cleared,
+        metadata_entries_cleared=metadata_entries_cleared,
+        pending_files_cleared=pending_files_cleared,
+        endpoint_cleared=bool(options.clear_endpoint),
+        output_channel_cleared=bool(options.clear_output_channel),
+        sniffer_disabled=bool(options.disable_sniffer),
+    )
+
+
+async def reset_admin_tunable_settings_to_defaults(interaction: discord.Interaction) -> ResetSettingsSummary:
+    """Reset all admin-tunable settings to defaults while preserving endpoint and join embed message refs."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    config = await load_guild_config(interaction)
+    realmshark_settings = dict(config.get("realmshark_settings", {}))
+    contest_settings = dict(config.get("contest_settings", {}))
+
+    preserved_endpoint = str(realmshark_settings.get("endpoint", "")).strip()
+    preserved_join_channel_id = int(contest_settings.get("join_contest_channel_id", 0) or 0)
+    preserved_join_message_id = int(contest_settings.get("join_contest_message_id", 0) or 0)
+    preserved_join_emoji = str(contest_settings.get("join_contest_emoji", "✅") or "✅").strip() or "✅"
+
+    reset_config = await save_guild_config(interaction, {})
+
+    reset_realmshark_settings = dict(reset_config.get("realmshark_settings", {}))
+    reset_realmshark_settings["endpoint"] = preserved_endpoint
+    reset_config["realmshark_settings"] = reset_realmshark_settings
+
+    reset_contest_settings = dict(reset_config.get("contest_settings", {}))
+    reset_contest_settings["join_contest_channel_id"] = preserved_join_channel_id
+    reset_contest_settings["join_contest_message_id"] = preserved_join_message_id
+    reset_contest_settings["join_contest_emoji"] = preserved_join_emoji
+    reset_config["contest_settings"] = reset_contest_settings
+
+    await save_guild_config(interaction, reset_config)
+
+    guild_id = str(interaction.guild.id)
+    picture_suggestion_channels_cleared = await clear_item_suggestions_enabled_channels(guild_id)
+    await set_item_suggestions_mode_enabled(guild_id, False)
+
+    return ResetSettingsSummary(
+        endpoint_preserved=bool(preserved_endpoint),
+        join_embed_preserved=preserved_join_channel_id > 0 and preserved_join_message_id > 0,
+        picture_suggestion_channels_cleared=picture_suggestion_channels_cleared,
+    )
+
+
+async def _remove_role_from_all_members(
+    guild: discord.Guild,
+    *,
+    role_name: str,
+    reason: str,
+) -> BulkRoleUpdateSummary:
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role is None:
+        return BulkRoleUpdateSummary(
+            role_name=role_name,
+            role_found=False,
+            members_updated=0,
+            members_failed=0,
+            records_cleared=0,
+            tokens_revoked=0,
+            removed_member_ids=[],
+        )
+
+    target_members = list(role.members)
+    members_updated = 0
+    members_failed = 0
+    removed_member_ids: list[int] = []
+    for member in target_members:
+        try:
+            await member.remove_roles(role, reason=reason)
+            members_updated += 1
+            removed_member_ids.append(int(member.id))
+        except (discord.Forbidden, discord.HTTPException):
+            members_failed += 1
+
+    return BulkRoleUpdateSummary(
+        role_name=role_name,
+        role_found=True,
+        members_updated=members_updated,
+        members_failed=members_failed,
+        records_cleared=0,
+        tokens_revoked=0,
+        removed_member_ids=removed_member_ids,
+    )
+
+
+async def _clear_join_embed_reactions(
+    interaction: discord.Interaction,
+    *,
+    member_ids: list[int],
+) -> int:
+    if interaction.guild is None or not member_ids:
+        return 0
+
+    settings = await get_contest_settings(interaction)
+    join_channel_id = int(settings.get("join_contest_channel_id", 0) or 0)
+    join_message_id = int(settings.get("join_contest_message_id", 0) or 0)
+    join_emoji = str(settings.get("join_contest_emoji", "✅") or "✅").strip() or "✅"
+
+    if join_channel_id <= 0 or join_message_id <= 0:
+        return 0
+
+    channel = interaction.guild.get_channel(join_channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return 0
+
+    try:
+        message = await channel.fetch_message(join_message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return 0
+
+    removed_reactions = 0
+    for member_id in member_ids:
+        member = interaction.guild.get_member(member_id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(member_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+
+        try:
+            await message.remove_reaction(join_emoji, member)
+            removed_reactions += 1
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    return removed_reactions
+
+
+async def remove_ppe_player_role_from_everyone(interaction: discord.Interaction) -> BulkRoleUpdateSummary:
+    """Remove PPE Player role from all members, revoke tokens, and clear all player records."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    summary = await _remove_role_from_all_members(
+        interaction.guild,
+        role_name="PPE Player",
+        reason="Season reset action - remove PPE Player role from everyone",
+    )
+
+    records = await load_player_records(interaction)
+    records_cleared = len(records)
+    await save_player_records(interaction, {})
+
+    realmshark_settings = await get_realmshark_settings(interaction)
+    links = realmshark_settings.get("links", {}) if isinstance(realmshark_settings.get("links", {}), dict) else {}
+    tokens_revoked = len(links)
+    realmshark_settings["links"] = {}
+    await set_realmshark_settings(interaction, realmshark_settings)
+
+    await _clear_join_embed_reactions(interaction, member_ids=summary.removed_member_ids)
+
+    summary.records_cleared = records_cleared
+    summary.tokens_revoked = tokens_revoked
+    return summary
+
+
+async def remove_ppe_admin_role_from_everyone(interaction: discord.Interaction) -> BulkRoleUpdateSummary:
+    """Remove PPE Admin role from all members who currently have it."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    return await _remove_role_from_all_members(
+        interaction.guild,
+        role_name="PPE Admin",
+        reason="Season reset action - remove PPE Admin role from everyone",
+    )
+
+
+async def clear_join_embed_information(interaction: discord.Interaction) -> JoinEmbedResetSummary:
+    """Clear join embed message references and delete the configured embed message when possible."""
+    settings = await get_contest_settings(interaction)
+    join_channel_id = int(settings.get("join_contest_channel_id", 0) or 0)
+    join_message_id = int(settings.get("join_contest_message_id", 0) or 0)
+    join_embed_was_configured = join_channel_id > 0 and join_message_id > 0
+
+    if not join_embed_was_configured:
+        return JoinEmbedResetSummary(
+            join_embed_was_configured=False,
+            join_embed_message_deleted=False,
+        )
+
+    result = await delete_join_contest_embed(interaction)
+    return JoinEmbedResetSummary(
+        join_embed_was_configured=True,
+        join_embed_message_deleted=bool(result.get("deleted_message", False)),
+    )
+
+
+async def delete_ppe_and_team_roles(interaction: discord.Interaction) -> RoleDeleteSummary:
+    """Delete PPE Admin/PPE Player roles and known team roles if they still exist."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    guild = interaction.guild
+    records = await load_player_records(interaction)
+    teams = await load_teams(interaction)
+
+    ppe_roles_deleted = 0
+    ppe_roles_failed = 0
+    for role_name in ("PPE Admin", "PPE Player"):
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role is None or role.managed:
+            continue
+
+        try:
+            await role.delete(reason="Season reset action - delete PPE role")
+            ppe_roles_deleted += 1
+        except (discord.Forbidden, discord.HTTPException):
+            ppe_roles_failed += 1
+
+    team_role_names = set(teams.keys())
+    team_role_names.update(_collect_team_names_from_records(records))
+
+    team_roles_deleted = 0
+    team_roles_failed = 0
+    for team_name in sorted(team_role_names):
+        if not team_name or team_name in {"PPE Admin", "PPE Player"}:
+            continue
+
+        role = discord.utils.get(guild.roles, name=team_name)
+        if role is None or role.managed:
+            continue
+
+        try:
+            await role.delete(reason="Season reset action - delete team role")
+            team_roles_deleted += 1
+        except (discord.Forbidden, discord.HTTPException):
+            team_roles_failed += 1
+
+    return RoleDeleteSummary(
+        ppe_roles_deleted=ppe_roles_deleted,
+        ppe_roles_failed=ppe_roles_failed,
+        team_roles_deleted=team_roles_deleted,
+        team_roles_failed=team_roles_failed,
+    )
+
+
 async def reset_season_data(
     interaction: discord.Interaction,
     *,
@@ -451,12 +1266,15 @@ async def reset_season_data(
     records = await load_player_records(interaction)
     config = await load_guild_config(interaction)
     default_reset_limit = int(config["quest_settings"]["num_resets"])
+    config_changed = _clear_team_quest_mode_state(config, disable_team_mode=True)
 
     teams = await load_teams(interaction)
     team_names = set(teams.keys())
 
     ppes_cleared, items_cleared, quest_entries_cleared = _reset_player_records(records, default_reset_limit)
     await save_player_records(interaction, records)
+    if config_changed:
+        await save_guild_config(interaction, config)
 
     teams_deleted = len(teams)
     teams.clear()
@@ -525,9 +1343,10 @@ def _reset_player_records(records: dict[str, Any], default_reset_limit: int) -> 
         ppes.clear()
         player_data.active_ppe = None
 
-        unique_items = getattr(player_data, "unique_items", set())
-        items_cleared += len(unique_items)
-        unique_items.clear()
+        season_item_history = getattr(player_data, "season_item_history", {})
+        if isinstance(season_item_history, dict):
+            items_cleared += _count_unique_items_from_history(season_item_history)
+            season_item_history.clear()
 
         quests = getattr(player_data, "quests", None)
         if quests is not None:

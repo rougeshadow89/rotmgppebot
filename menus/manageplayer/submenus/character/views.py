@@ -21,7 +21,7 @@ from menus.manageplayer.services import delete_single_ppe_for_target, find_ppe_o
 from menus.manageplayer.targets import ManagedPlayerTarget
 from menus.menu_utils import OwnerBoundView
 from utils.guild_config import load_guild_config
-from utils.helpers.shareloot_image import generate_loot_share_image, variant_image_label
+from utils.loot_helpers.shareloot_image import generate_loot_share_image, variant_image_label
 from utils.player_statistics import build_character_wrapped_embed
 from utils.penalty_embed import build_penalty_infographic_embed
 from utils.player_records import ensure_player_exists, load_player_records, save_player_records
@@ -126,6 +126,7 @@ class ManagePlayerPenaltiesModal(discord.ui.Modal, title="Set PPE Penalties"):
             loot_penalty=components["Loot Boost Penalty"],
             incombat_penalty=components["In-Combat Reduction Penalty"],
             total_points=points_breakdown["total"],
+            guild_config=guild_config,
         )
 
         from menus.manageplayer.common import display_class_name, format_points
@@ -300,7 +301,10 @@ class ManagePlayerCharacterLootView(OwnerBoundView):
 
         refreshed = await load_target_player_data(interaction, self.target.user_id)
         selected = find_ppe_or_raise(refreshed, self.ppe_id)
-        source_items = [(loot_item.item_name, bool(loot_item.shiny)) for loot_item in selected.loot]
+        source_items = [
+            (loot_item.item_name, bool(loot_item.shiny), str(getattr(loot_item, "rarity", "common")))
+            for loot_item in selected.loot
+        ]
 
         await generate_loot_share_image(
             interaction,

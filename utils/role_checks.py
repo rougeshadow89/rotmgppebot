@@ -1,3 +1,5 @@
+"""Utilities for role checks."""
+
 import discord
 from discord import Member, User, app_commands
 
@@ -41,6 +43,31 @@ def require_ppe_roles(admin_required: bool = False, player_required: bool = Fals
 
         if player_required and player_role not in member.roles:
             await safe_respond("🚫 You need the **PPE Player** role to use this command.")
+            return False
+
+        return True
+
+    return app_commands.check(predicate)
+
+
+def require_server_owner():
+    async def predicate(inter: discord.Interaction):
+        async def safe_respond(message: str):
+            try:
+                if not inter.response.is_done():
+                    await inter.response.send_message(message, ephemeral=True)
+                else:
+                    await inter.followup.send(message, ephemeral=True)
+            except Exception:
+                pass
+
+        guild = inter.guild
+        if guild is None:
+            await safe_respond("❌ This command can only be used in a server.")
+            return False
+
+        if inter.user.id != guild.owner_id:
+            await safe_respond("🚫 Only the server owner can use this command.")
             return False
 
         return True

@@ -1,15 +1,43 @@
-from csv import Error
+"""Utilities for player records."""
+
 import os
 import json
 import asyncio
 import re
+import glob
 from typing import Dict, Any, List
 
 from dataclasses import asdict
 
 import discord
 from dataclass import Loot, PPEData, PlayerData, Bonus, TeamData, QuestData
+from utils.loot_constants import normalize_rarity, rarity_rank
 from utils.ppe_types import normalize_ppe_type
+
+_DASH_VARIANTS = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+
+
+def _normalize_item_name(name: str) -> str:
+    if not name:
+        return ""
+    normalized = name
+    normalized = normalized.replace("\u2018", "'").replace("\u2019", "'").replace("\u02bc", "'").replace("\u2032", "'").replace("\u00b4", "'").replace("`", "'")
+    for dash in _DASH_VARIANTS:
+        normalized = normalized.replace(dash, "-")
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+    return " ".join(normalized.split()).strip()
+
+
+def _normalize_rarity(value: Any, fallback: str = "common") -> str:
+    return normalize_rarity(value, fallback)
+
+
+def _rarity_rank(value: str) -> int:
+    return rarity_rank(value)
+
+
+def highest_rarity(first: str, second: str) -> str:
+    return first if _rarity_rank(first) >= _rarity_rank(second) else second
 
 # Persistent data directory (Railway Volume)
 DATA_DIR = "/data"
@@ -26,9 +54,28 @@ def get_lock(guild_id: int) -> asyncio.Lock:
     return _locks[guild_id]
 
 
-def get_guild_data_path(guild_id: int) -> str:
-    """Return the file path for this guild's data file."""
-    return os.path.join(DATA_DIR, f"{guild_id}_loot_records.json")
+def get_player_data_path(guild_id: int, user_id: int) -> str:
+    """Return the file path for one player's data file."""
+    return os.path.join(DATA_DIR, f"{guild_id}_{user_id}_loot_records.json")
+
+
+def get_guild_player_data_pattern(guild_id: int) -> str:
+    """Return glob pattern for all player record files in a guild."""
+    return os.path.join(DATA_DIR, f"{guild_id}_*_loot_records.json")
+
+
+def _parse_user_id_from_player_data_path(guild_id: int, path: str) -> int | None:
+    """Extract the user_id from a per-user player-record path."""
+    filename = os.path.basename(path)
+    match = re.match(r"^(\d+)_(\d+)_loot_records\.json$", filename)
+    if not match:
+        return None
+
+    parsed_guild_id = int(match.group(1))
+    parsed_user_id = int(match.group(2))
+    if parsed_guild_id != guild_id:
+        return None
+    return parsed_user_id
 
 
 # -------------------------------------------------------------------------
@@ -51,11 +98,29 @@ def normalize_ppe(ppe: dict) -> PPEData:
     
     for loot_dict in loot_dicts:
         # Ensure all required fields exist with defaults
+        legacy_divine = bool(loot_dict.get("divine", False))
+        rarity = _normalize_rarity(loot_dict.get("rarity"), "divine" if legacy_divine else "common")
+        raw_logged_times = loot_dict.get("logged_times", [])
+        logged_times: list[int] = []
+        if isinstance(raw_logged_times, list):
+            for raw_ts in raw_logged_times:
+                try:
+                    parsed_ts = int(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+                if parsed_ts > 0:
+                    logged_times.append(parsed_ts)
+        logged_times.sort()
+
+        if not logged_times:
+            logged_times = []
+
         normalized_loot = {
             "item_name": loot_dict.get("item_name", "Unknown Item"),
             "quantity": loot_dict.get("quantity", 0),
-            "divine": loot_dict.get("divine", False),
-            "shiny": loot_dict.get("shiny", False)
+            "shiny": loot_dict.get("shiny", False),
+            "rarity": rarity,
+            "logged_times": logged_times,
         }
         loot_objects.append(Loot(**normalized_loot))
     
@@ -73,6 +138,12 @@ def normalize_ppe(ppe: dict) -> PPEData:
         }
         bonus_objects.append(Bonus(**normalized_bonus))
     
+    # Load completed_sets (defaults to empty list if not present)
+    completed_sets_raw = ppe.get("completed_sets", [])
+    completed_sets = []
+    if isinstance(completed_sets_raw, list):
+        completed_sets = [str(s) for s in completed_sets_raw if s]
+    
     return PPEData(
         id=ppe.get("id", 0),
         name=ppe.get("name", "Unknown"),
@@ -80,6 +151,7 @@ def normalize_ppe(ppe: dict) -> PPEData:
         loot=loot_objects,
         bonuses=bonus_objects,
         ppe_type=normalize_ppe_type(ppe.get("ppe_type")),
+        completed_sets=completed_sets,
     )
 
 
@@ -114,55 +186,53 @@ def normalize_player(player: dict) -> PlayerData:
         completed_skins=safe_str_list(quests_raw.get("completed_skins", player.get("completed_skin_quests", []))),
     )
     
-    # Handle unique_items migration - rebuild from PPEs if missing
-    unique_items_list = player.get("unique_items", None)
-    if unique_items_list is not None:
-        # Load from saved data (list of tuples)
-        unique_items = set(tuple(item) for item in unique_items_list)
-    else:
-        # Rebuild from all PPEs for migration
-        print("Migrating unique_items from PPE loot data...")
-        unique_items = set()
-        for ppe in ppes:
-            for loot in ppe.loot:
-                unique_items.add((loot.item_name, loot.shiny))
+    season_item_history = player.get("season_item_history", {})
+    if not isinstance(season_item_history, dict):
+        season_item_history = {}
 
-    return PlayerData(
+    normalized_player = PlayerData(
         ppes=ppes,
         active_ppe=player.get("active_ppe"),
         is_member=bool(player.get("is_member", False)),
-        unique_items=unique_items,
+        season_item_history=season_item_history,
         team_name=player.get("team_name", None),
         quests=normalized_quests,
         quest_resets_remaining=safe_optional_non_negative_int(player.get("quest_resets_remaining")),
     )
+    return normalized_player
 
 async def load_player_records(interaction: discord.Interaction) -> Dict[int, PlayerData]:
     """Load player records for a specific guild safely and non-blockingly."""
     if interaction.guild is None:
             raise ValueError("Interaction guild is None.")
     guild_id = interaction.guild.id
-    path = get_guild_data_path(guild_id)
-
-    if not os.path.exists(path):
-        return {}
+    pattern = get_guild_player_data_pattern(guild_id)
 
     async with get_lock(guild_id):
         try:
-            raw_data = await asyncio.to_thread(_read_json_file, path)
-            # Handle migration from string keys to int keys
-            migrated_data = {}
-            for key, value in raw_data.items():
-                try:
-                    # Try to convert key to int (new format)
-                    int_key = int(key)
-                    migrated_data[int_key] = normalize_player(value)
-                except ValueError:
-                    # Skip string keys (old format) for now
-                    # You could add logic here to migrate based on username lookup if needed
-                    print(f"Skipping old string key: {key}")
+            paths = await asyncio.to_thread(glob.glob, pattern)
+            loaded_records: Dict[int, PlayerData] = {}
+
+            for path in paths:
+                user_id = _parse_user_id_from_player_data_path(guild_id, path)
+                if user_id is None:
                     continue
-            return migrated_data
+
+                raw_data = await asyncio.to_thread(_read_json_file, path)
+                if not isinstance(raw_data, dict):
+                    continue
+
+                # Current format stores exactly one player's payload in each file.
+                if "ppes" in raw_data:
+                    loaded_records[user_id] = normalize_player(raw_data)
+                    continue
+
+                # Allow accidental nested format and read the matching user entry if present.
+                nested = raw_data.get(str(user_id))
+                if isinstance(nested, dict):
+                    loaded_records[user_id] = normalize_player(nested)
+
+            return loaded_records
         except Exception as e:
             print(f"Error loading player records for guild {guild_id}: {type(e).__name__}: {e}")
             import traceback
@@ -186,48 +256,78 @@ async def save_player_records(interaction: discord.Interaction, records: Dict[in
     if interaction.guild is None:
         raise ValueError("Interaction guild is None.")
     guild_id = interaction.guild.id
-    path = get_guild_data_path(guild_id)
-    temp_path = f"{path}.tmp"
+    pattern = get_guild_player_data_pattern(guild_id)
 
-    # Convert typed PlayerData objects into plain dicts
-    json_ready = {
-        str(user_id): {  # Convert int key to string for JSON
-            "is_member": data.is_member,
-            "ppes": [
-                {
-                    "id": p.id,
-                    "name": p.name,
-                    "points": p.points,
-                    "loot": [asdict(l) for l in p.loot],
-                    "bonuses": [asdict(b) for b in p.bonuses],
-                    "ppe_type": normalize_ppe_type(getattr(p, "ppe_type", None)),
-                }
-                for p in data.ppes
-            ],
-            "active_ppe": data.active_ppe,
-            "unique_items": list(data.unique_items),  # Convert set to list for JSON
-            "team_name": data.team_name,
-            "quest_resets_remaining": data.quest_resets_remaining,
-            "quests": {
-                "current_items": data.quests.current_items,
-                "current_shinies": data.quests.current_shinies,
-                "current_skins": data.quests.current_skins,
-                "completed_items": data.quests.completed_items,
-                "completed_shinies": data.quests.completed_shinies,
-                "completed_skins": data.quests.completed_skins,
-            }
-        }
-        for user_id, data in records.items()
-    }
+    normalized_records: Dict[int, PlayerData] = {}
+    for user_id, data in records.items():
+        normalized_records[int(user_id)] = data
+
     async with get_lock(guild_id):
-        await asyncio.to_thread(_write_atomic_json, path, temp_path, json_ready)
+        existing_paths = await asyncio.to_thread(glob.glob, pattern)
+        existing_ids: set[int] = set()
+        for existing_path in existing_paths:
+            parsed_user_id = _parse_user_id_from_player_data_path(guild_id, existing_path)
+            if parsed_user_id is not None:
+                existing_ids.add(parsed_user_id)
+
+        desired_ids = set(normalized_records.keys())
+
+        for user_id, data in normalized_records.items():
+            path = get_player_data_path(guild_id, user_id)
+            temp_path = f"{path}.tmp"
+            await asyncio.to_thread(_write_atomic_json, path, temp_path, _serialize_player_data(data))
+
+        stale_ids = existing_ids - desired_ids
+        for stale_user_id in stale_ids:
+            stale_path = get_player_data_path(guild_id, stale_user_id)
+            await asyncio.to_thread(_delete_file_if_exists, stale_path)
+
+
+def _serialize_player_data(data: PlayerData) -> Dict[str, Any]:
+    """Convert PlayerData into JSON-ready dict for one per-user file."""
+    return {
+        "is_member": data.is_member,
+        "ppes": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "points": p.points,
+                "loot": [
+                    {
+                        "item_name": l.item_name,
+                        "quantity": l.quantity,
+                        "shiny": l.shiny,
+                        "rarity": l.rarity,
+                        "logged_times": list(getattr(l, "logged_times", [])),
+                    }
+                    for l in p.loot
+                ],
+                "bonuses": [asdict(b) for b in p.bonuses],
+                "ppe_type": normalize_ppe_type(getattr(p, "ppe_type", None)),
+                "completed_sets": list(getattr(p, "completed_sets", [])),
+            }
+            for p in data.ppes
+        ],
+        "active_ppe": data.active_ppe,
+        "season_item_history": dict(getattr(data, "season_item_history", {})),
+        "team_name": data.team_name,
+        "quest_resets_remaining": data.quest_resets_remaining,
+        "quests": {
+            "current_items": data.quests.current_items,
+            "current_shinies": data.quests.current_shinies,
+            "current_skins": data.quests.current_skins,
+            "completed_items": data.quests.completed_items,
+            "completed_shinies": data.quests.completed_shinies,
+            "completed_skins": data.quests.completed_skins,
+        },
+    }
 
 
 def _write_atomic_json(path: str, temp_path: str, data: dict):
     """Write JSON atomically to avoid corruption."""
     # Write to temp file first
     with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
 
     # Optional: backup old file
     # if os.path.exists(path):
@@ -235,6 +335,14 @@ def _write_atomic_json(path: str, temp_path: str, data: dict):
 
     # Atomically replace the real file
     os.replace(temp_path, path)
+
+
+def _delete_file_if_exists(path: str):
+    """Delete a file if present; ignore races/missing files."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
 
 
 # -------------------------------------------------------------------------
@@ -272,10 +380,16 @@ async def get_active_ppe_of_user(interaction: discord.Interaction) -> PPEData:
     await save_player_records(interaction, records)
     return get_active_ppe(player_data)
 
-def get_item_from_ppe(active_ppe: PPEData, item_name: str, divine: bool, shiny: bool) -> Loot | None:
+def get_item_from_ppe(active_ppe: PPEData, item_name: str, shiny: bool, rarity: str | None = None) -> Loot | None:
     """Return the Loot object from active PPE by item name, or None."""
+    requested_rarity = _normalize_rarity(rarity, "common")
     for item in active_ppe.loot:
-        if item.item_name.lower() == item_name.lower() and item.divine == divine and item.shiny == shiny and item.quantity > 0:
+        if (
+            item.item_name.lower() == _normalize_item_name(item_name).lower()
+            and item.shiny == shiny
+            and _normalize_rarity(getattr(item, "rarity", None), "common") == requested_rarity
+            and item.quantity > 0
+        ):
             return item
     return None
 

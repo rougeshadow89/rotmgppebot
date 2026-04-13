@@ -1,20 +1,22 @@
 import discord
-from utils.player_records import ensure_player_exists, load_player_records, save_player_records
-from utils.points_service import calculate_drop_points
-from utils.player_manager import player_manager
-from utils.embed_builders import build_loot_embed
-from utils.loot_data import LOOT
 
-async def command(interaction: discord.Interaction, user: discord.Member, id: int, item_name: str, divine: bool = False, shiny: bool = False):
+from utils.player_records import ensure_player_exists, load_player_records
+from utils.loot_data import LOOT
+from utils.loot_ops import (
+    format_ppe_remove_message,
+    remove_ppe_loot,
+    send_ppe_markdown_followup,
+    validate_loot_input,
+)
+
+async def command(interaction: discord.Interaction, user: discord.Member, id: int, item_name: str, rarity: str, shiny: bool = False):
     if not interaction.guild:
         return await interaction.response.send_message("❌ This command can only be used in a server.")
     
-    # if item_name not in LOOT:
-    #     return await interaction.response.send_message(
-    #         f"❌ `{item_name}` is not a recognized item name.\n"
-    #         f"Use the autocomplete suggestions to select a valid item.",
-    #         ephemeral=True
-    #     )
+    try:
+        validate_loot_input(item_name, shiny=shiny, known_items=LOOT)
+    except ValueError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
     
     # Load player records
     records = await load_player_records(interaction)
@@ -42,29 +44,20 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
         )
     
     try:
-        # Calculate points for the item
-        points = calculate_drop_points(item_name, divine, shiny)
-        
-        
-        # Remove loot and points using player_manager
-        final_key, points_removed, updated_ppe = await player_manager.remove_loot_and_points(
-            interaction, user=user, ppe_id=id, item_name=item_name, divine=divine, shiny=shiny, points=points
-        )
-        
-        # Build embed
-        embed = await build_loot_embed(updated_ppe, user_id=user.id, recently_added=item_name)
-        
-        await interaction.response.send_message(
-            f"> ✅ Removed **1x {final_key}** from {user.mention}'s PPE #{updated_ppe.id} ({updated_ppe.name})!\n"
-            f"**-{points_removed} points**\n"
-        )
+        rarity_normalized = rarity.lower().strip()
 
-        await interaction.followup.send(
-            content=f"{user.display_name}'s PPE #{updated_ppe.id} now has **{updated_ppe.points} total points**.",
-            view=embed,
-            embed=embed.embeds[0],
-            ephemeral=True
+        result = await remove_ppe_loot(
+            interaction,
+            user=user,
+            ppe_id=id,
+            item_name=item_name,
+            shiny=shiny,
+            rarity=rarity_normalized,
         )
+        
+        await interaction.response.send_message(format_ppe_remove_message(result))
+
+        await send_ppe_markdown_followup(interaction, ppe=result.ppe, ephemeral=True)
         
     except (ValueError, KeyError, LookupError) as e:
         return await interaction.response.send_message(str(e), ephemeral=True)

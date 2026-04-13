@@ -1,3 +1,5 @@
+"""Utilities for find items."""
+
 import cv2
 import numpy as np
 import os
@@ -201,6 +203,7 @@ def find_items_in_image(
                 "confidence": float(best_val),
                 "divine": False,
                 "shiny": is_shiny,
+                "rarity": "common",
             })
             print(f"[DEBUG] Slot {i+1}: {best_item:30s}, Shiny: {is_shiny} | Confidence: {best_val:.3f} | "
                   f"(Structure: {best_structural:.3f}, Color: {best_color:.3f})")

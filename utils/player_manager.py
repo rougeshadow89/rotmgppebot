@@ -1,12 +1,28 @@
+"""Utilities for player manager."""
+
 import asyncio
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import discord
 from dataclass import Loot, PPEData, PlayerData
 from utils.player_records import load_player_records, save_player_records, ensure_player_exists, get_active_ppe
+from utils.player_records import get_item_from_ppe, highest_rarity, load_teams
 from utils.quest_manager import update_quests_for_item
 from utils.guild_config import get_max_ppes, get_quest_targets
-from utils.guild_config import load_guild_config
+from utils.guild_config import load_guild_config, save_guild_config
+from utils.quest_modes import build_global_quests_payload, build_team_quests_context
 from utils.points_service import recompute_ppe_points
+from utils.item_log_timestamps import now_unix_utc
+from utils.season_loot_history import add_season_item_log, normalize_rarity, remove_season_item_log
+from utils.set_operations import get_newly_completed_sets, get_no_longer_completed_sets
+
+
+def _remove_most_recent_timestamp(times: list[int]) -> list[int]:
+    if not times:
+        return []
+
+    sorted_times = sorted(int(ts) for ts in times)
+    sorted_times.pop()
+    return sorted_times
 
 class PlayerManager:
     """Centralized manager for player data operations to prevent race conditions."""
@@ -39,8 +55,9 @@ class PlayerManager:
             return result
     
     async def add_loot_and_points(self, interaction: discord.Interaction, user: discord.Member, ppe_id:int, item_name: str,
-                                divine: bool = False, shiny: bool = False, points: float = 0) -> tuple:
-        """Add loot and points atomically."""
+                                shiny: bool = False, rarity: str = "common", points: float = 0) -> tuple:
+        """Add loot and points atomically. Returns (item_name, points_rounded, active_ppe, quest_update, newly_completed_sets)."""
+        effective_rarity = normalize_rarity(rarity, "common")
         
         async def operation(records, interaction):
             user_id = user.id
@@ -64,23 +81,89 @@ class PlayerManager:
                 raise LookupError("❌ Could not find your active PPE record.")
             
             old_total = active_ppe.points
+            
+            # Store previously completed sets before adding loot
+            previously_completed_sets = list(active_ppe.completed_sets) if active_ppe.completed_sets else []
 
             # Add loot
-            from utils.player_records import get_item_from_ppe
-            match = get_item_from_ppe(active_ppe, item_name, divine, shiny)
+            match = get_item_from_ppe(active_ppe, item_name, shiny, rarity=effective_rarity)
+            logged_at = now_unix_utc()
             if match:
                 match.quantity += 1
+                times = list(getattr(match, "logged_times", []))
+                times.append(logged_at)
+                times.sort()
+                setattr(match, "logged_times", times)
             else:
-                active_ppe.loot.append(Loot(item_name=item_name, quantity=1, divine=divine, shiny=shiny))
-            
-            # Update unique_items cache
-            player_data.unique_items.add((item_name, shiny))
+                active_ppe.loot.append(
+                    Loot(
+                        item_name=item_name,
+                        quantity=1,
+                        shiny=shiny,
+                        rarity=effective_rarity,
+                        logged_times=[logged_at],
+                    )
+                )
+
+            add_season_item_log(
+                player_data,
+                item_name=item_name,
+                shiny=shiny,
+                rarity=effective_rarity,
+                timestamp=logged_at,
+            )
             
             guild_config = await load_guild_config(interaction)
+            
+            # Check for newly completed sets
+            newly_completed = get_newly_completed_sets(active_ppe, previously_completed_sets)
+            
+            if newly_completed:
+                from utils.guild_config import get_set_bonuses
+                from utils.set_operations import load_item_sets
+                set_bonuses = get_set_bonuses(guild_config)
+                all_sets = load_item_sets()
+                
+                # Add newly completed sets to the tracking list
+                for set_name, set_type in newly_completed:
+                    if set_name not in active_ppe.completed_sets:
+                        active_ppe.completed_sets.append(set_name)
+                
+                # Recalculate TOTAL set bonus based on ALL completed sets (not just newly completed)
+                # This ensures we have one consolidated "Set Completion Bonus" entry
+                total_set_bonus = 0.0
+                for set_name in active_ppe.completed_sets:
+                    if set_name in all_sets:
+                        set_type = all_sets[set_name]["type"]
+                        if set_type in set_bonuses and set_name in set_bonuses[set_type]:
+                            total_set_bonus += set_bonuses[set_type][set_name]
+                
+                # Remove all existing "Set Completion Bonus" entries
+                active_ppe.bonuses = [b for b in active_ppe.bonuses if b.name != "Set Completion Bonus"]
+                
+                # Add new consolidated set bonus if there are any points
+                if total_set_bonus > 0:
+                    from dataclass import Bonus
+                    bonus = Bonus(
+                        name="Set Completion Bonus",
+                        points=total_set_bonus,
+                        repeatable=False,
+                        quantity=1
+                    )
+                    active_ppe.bonuses.append(bonus)
+            
             recompute_ppe_points(active_ppe, guild_config)
             points_rounded = round(active_ppe.points - old_total, 2)
 
             regular_target, shiny_target, skin_target = await get_quest_targets(interaction)
+            quest_settings = guild_config["quest_settings"]
+            teams = await load_teams(interaction)
+            team_context = build_team_quests_context(
+                settings=quest_settings,
+                player_data=player_data,
+                records=records,
+                teams=teams,
+            )
             quest_update = update_quests_for_item(
                 player_data,
                 item_name,
@@ -88,21 +171,21 @@ class PlayerManager:
                 target_item_quests=regular_target,
                 target_shiny_quests=shiny_target,
                 target_skin_quests=skin_target,
-                global_quests={
-                    "enabled": bool(guild_config["quest_settings"].get("use_global_quests", False)),
-                    "regular": list(guild_config["quest_settings"].get("global_regular_quests", [])),
-                    "shiny": list(guild_config["quest_settings"].get("global_shiny_quests", [])),
-                    "skin": list(guild_config["quest_settings"].get("global_skin_quests", [])),
-                },
+                global_quests=build_global_quests_payload(quest_settings),
+                team_quests=team_context,
             )
+
+            if quest_update.get("team_state_changed"):
+                await save_guild_config(interaction, guild_config)
             
-            return item_name, points_rounded, active_ppe, quest_update
+            return item_name, points_rounded, active_ppe, quest_update, newly_completed
         
         return await self.execute_transaction(interaction, operation)
     
     async def remove_loot_and_points(self, interaction: discord.Interaction, user: discord.Member, ppe_id: int, item_name: str, 
-                                   divine: bool = False, shiny: bool = False, points: float = 0) -> tuple:
-        """Remove loot and points atomically."""
+                                   shiny: bool = False, rarity: str = "common", points: float = 0) -> tuple:
+        """Remove loot and points atomically. Returns (item_name, points_rounded, active_ppe, removed_sets)."""
+        effective_rarity = normalize_rarity(rarity, "common")
         
         async def operation(records, interaction):
             user_id = user.id
@@ -118,14 +201,19 @@ class PlayerManager:
             if not active_ppe:
                 raise LookupError("❌ Could not find your active PPE record.")
             
-            from utils.player_records import get_item_from_ppe
-            item = get_item_from_ppe(active_ppe, item_name, divine, shiny)
+            item = get_item_from_ppe(active_ppe, item_name, shiny, rarity=effective_rarity)
             if not item:
                 raise ValueError(f"❌ You don't have any **{item_name}** in your active PPE's loot.")
             
             old_total = active_ppe.points
             
+            # Store previously completed sets before removing loot
+            previously_completed_sets = list(active_ppe.completed_sets) if active_ppe.completed_sets else []
+            
             item.quantity -= 1
+            times = list(getattr(item, "logged_times", []))
+            if times:
+                setattr(item, "logged_times", _remove_most_recent_timestamp(times))
             if item.quantity <= 0:
                 active_ppe.loot.remove(item)
                 
@@ -139,19 +227,60 @@ class PlayerManager:
                             break
                     if item_exists_elsewhere:
                         break
+
+            remove_season_item_log(
+                player_data,
+                item_name=item_name,
+                shiny=shiny,
+                rarity=effective_rarity,
+                remove_all=False,
+            )
+            
+            # Check for sets that are no longer completed and remove their bonuses
+            no_longer_completed_sets = get_no_longer_completed_sets(active_ppe, previously_completed_sets)
+            if no_longer_completed_sets:
+                from utils.set_operations import load_item_sets
+                from utils.guild_config import get_set_bonuses
                 
-                # Only remove from unique_items if not found in any PPE
-                if not item_exists_elsewhere:
-                    player_data.unique_items.discard(item_key)
+                guild_config = await load_guild_config(interaction)
+                set_bonuses = get_set_bonuses(guild_config)
+                all_sets = load_item_sets()
+                
+                # Remove sets from tracking
+                for removed_set_name, _ in no_longer_completed_sets:
+                    if removed_set_name in active_ppe.completed_sets:
+                        active_ppe.completed_sets.remove(removed_set_name)
+                
+                # Recalculate total set bonus based on remaining completed sets
+                remaining_set_bonus = 0.0
+                for set_name in active_ppe.completed_sets:
+                    if set_name in all_sets:
+                        set_type = all_sets[set_name]["type"]
+                        if set_type in set_bonuses and set_name in set_bonuses[set_type]:
+                            remaining_set_bonus += set_bonuses[set_type][set_name]
+                
+                # Remove all "Set Completion Bonus" entries
+                active_ppe.bonuses = [b for b in active_ppe.bonuses if b.name != "Set Completion Bonus"]
+                
+                # Re-add the new set bonus amount if there are any remaining sets
+                if remaining_set_bonus > 0:
+                    from dataclass import Bonus
+                    bonus = Bonus(
+                        name="Set Completion Bonus",
+                        points=remaining_set_bonus,
+                        repeatable=False,
+                        quantity=1
+                    )
+                    active_ppe.bonuses.append(bonus)
             
             guild_config = await load_guild_config(interaction)
             recompute_ppe_points(active_ppe, guild_config)
             points_rounded = round(old_total - active_ppe.points, 2)
             
-            return item_name, points_rounded, active_ppe
+            return item_name, points_rounded, active_ppe, no_longer_completed_sets
         
         return await self.execute_transaction(interaction, operation)
-    
+
     async def add_points_only(self, interaction: discord.Interaction, amount: float) -> float:
         """Add points only (for admin commands)."""
         

@@ -1,28 +1,25 @@
 import discord
-from utils.player_records import ensure_player_exists, load_player_records, save_player_records
-from utils.points_service import calculate_drop_points, has_item_variant
-from utils.player_manager import player_manager
+import os
+
+from utils.player_records import ensure_player_exists, load_player_records
 from utils.embed_builders import build_loot_embed
 from utils.loot_data import LOOT
+from utils.image_utils import overlay_rarity_badge, resolve_item_image_path
+from utils.loot_ops import (
+    add_ppe_loot,
+    format_ppe_add_message,
+    send_ppe_markdown_followup,
+    validate_loot_input,
+)
 
-async def command(interaction: discord.Interaction, user: discord.Member, id: int, item_name: str, divine: bool = False, shiny: bool = False):
+async def command(interaction: discord.Interaction, user: discord.Member, id: int, item_name: str, shiny: bool = False, rarity: str = "common"):
     if not interaction.guild:
         return await interaction.response.send_message("❌ This command can only be used in a server.")
     
-    if item_name not in LOOT:
-        return await interaction.response.send_message(
-            f"❌ `{item_name}` is not a recognized item name.\n"
-            f"Use the autocomplete suggestions to select a valid item.",
-            ephemeral=True
-        )
-    
-    # Validate that shiny variant exists in database
-    if shiny:
-        if not has_item_variant(item_name, shiny=True):
-            return await interaction.response.send_message(
-                f"❌ Shiny variant of `{item_name}` is not currently in bot.",
-                ephemeral=True
-            )
+    try:
+        validate_loot_input(item_name, shiny=shiny, known_items=LOOT)
+    except ValueError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
     
     # Load player records
     records = await load_player_records(interaction)
@@ -50,27 +47,43 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
         )
     
     try:
-        # Calculate points for the item
-        points = calculate_drop_points(item_name, divine, shiny)
-        
-        # Add loot and points using player_manager
-        final_key, points_added, updated_ppe, _quest_update = await player_manager.add_loot_and_points(
-            interaction, user=user, ppe_id=id, item_name=item_name, divine=divine, shiny=shiny, points=points
+        rarity_normalized = rarity.lower().strip()
+        result = await add_ppe_loot(
+            interaction,
+            user=user,
+            ppe_id=id,
+            item_name=item_name,
+            shiny=shiny,
+            rarity=rarity_normalized,
         )
         
         # Build embed
-        embed = await build_loot_embed(updated_ppe, user_id=user.id, recently_added=item_name)
+        embed = await build_loot_embed(result.ppe, user_id=user.id, recently_added=item_name)
         
-        await interaction.response.send_message(
-            f"> ✅ Added **1x {final_key}** to {user.mention}'s PPE #{updated_ppe.id} ({updated_ppe.name})!\n"
-            f"**+{points_added} points**\n"
-        )
+        response_file: discord.File | None = None
+        overlay_path: str | None = None
+        image_path = resolve_item_image_path(item_name, shiny=shiny)
+        if image_path:
+            overlay_path = overlay_rarity_badge(image_path, rarity_normalized)
+            response_file = discord.File(overlay_path or image_path)
+
+        await interaction.response.send_message(format_ppe_add_message(result), file=response_file)
+        await send_ppe_markdown_followup(interaction, ppe=result.ppe, ephemeral=True)
         await interaction.followup.send(
-            content=f"{user.display_name}'s PPE #{updated_ppe.id} now has **{updated_ppe.points} total points**.",
+            content=f"{user.display_name}'s PPE #{result.ppe.id} now has **{result.ppe.points} total points**.",
             view=embed,
             embed=embed.embeds[0],
             ephemeral=True
         )
+
+        # Send set completion messages
+        if result.newly_completed_sets:
+            set_lines = [f"🎉 **Set Completed!** {set_name} ({set_type})" for set_name, set_type in result.newly_completed_sets]
+            await interaction.followup.send("\n".join(set_lines), ephemeral=False)
+
+        if overlay_path and image_path and overlay_path != image_path:
+            if os.path.exists(overlay_path):
+                os.remove(overlay_path)
         
     except (ValueError, KeyError, LookupError) as e:
         return await interaction.response.send_message(str(e), ephemeral=True)

@@ -1,3 +1,5 @@
+"""Utilities for guild config."""
+
 import asyncio
 import json
 import os
@@ -28,9 +30,11 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "skin_points": 15,
         "num_resets": 3,
         "use_global_quests": False,
+        "enable_team_quests": False,
         "global_regular_quests": [],
         "global_shiny_quests": [],
         "global_skin_quests": [],
+        "team_quests_state": {},
     },
     "realmshark_settings": {
         "enabled": False,
@@ -41,6 +45,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "contest_settings": {
         "default_contest_leaderboard": None,
+        "ppe_aggregate_points_enabled": False,
+        "ppe_contest_include_quest_points": False,
+        "team_aggregate_points_enabled": False,
         "team_contest_include_quest_points": False,
         "join_contest_channel_id": 0,
         "join_contest_message_id": 0,
@@ -53,6 +60,20 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "penalty_percent": 0.0,
             "total_percent": 0.0,
         },
+        "rarity_multipliers": {
+            "common": 1.0,
+            "uncommon": 1.0,
+            "rare": 1.0,
+            "legendary": 1.0,
+            "divine": 2.0,
+        },
+        "starting_penalty_modifiers": {
+            "pet_level_percent_reduction": 0.0,
+            "exalts_percent_reduction": 0.0,
+            "loot_percent_reduction": 0.0,
+            "incombat_percent_reduction": 0.0,
+        },
+        "duplicate_point_reduction": 0.5,
         "penalty_weights": {
             "pet_level_per_point": 4.0,
             "exalts_per_point": 2.0,
@@ -60,6 +81,12 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "incombat_seconds_per_point": 0.1,
         },
         "class_overrides": {},
+        "set_overrides": {
+            "ST": {},
+            "UT": {},
+        },
+        "default_ut_points": 0.0,
+        "default_st_points": 0.0,
     },
 }
 
@@ -105,6 +132,27 @@ def _normalized_targets(config: Dict[str, Any]) -> Dict[str, Any]:
                 normalized.append(text)
         return normalized
 
+    def _as_team_quest_state_map(value: Any) -> dict[str, dict[str, list[str]]]:
+        if not isinstance(value, dict):
+            return {}
+
+        output: dict[str, dict[str, list[str]]] = {}
+        for raw_team_name, raw_state in value.items():
+            if not isinstance(raw_team_name, str):
+                continue
+            team_name = raw_team_name.strip().lower()
+            if not team_name or not isinstance(raw_state, dict):
+                continue
+            output[team_name] = {
+                "current_items": _as_string_list(raw_state.get("current_items")),
+                "current_shinies": _as_string_list(raw_state.get("current_shinies")),
+                "current_skins": _as_string_list(raw_state.get("current_skins")),
+                "completed_items": _as_string_list(raw_state.get("completed_items")),
+                "completed_shinies": _as_string_list(raw_state.get("completed_shinies")),
+                "completed_skins": _as_string_list(raw_state.get("completed_skins")),
+            }
+        return output
+
     return {
         "regular_target": _as_non_negative_int(settings.get("regular_target"), _DEFAULT_CONFIG["quest_settings"]["regular_target"]),
         "shiny_target": _as_non_negative_int(settings.get("shiny_target"), _DEFAULT_CONFIG["quest_settings"]["shiny_target"]),
@@ -114,9 +162,11 @@ def _normalized_targets(config: Dict[str, Any]) -> Dict[str, Any]:
         "skin_points": _as_non_negative_int(settings.get("skin_points"), _DEFAULT_CONFIG["quest_settings"]["skin_points"]),
         "num_resets": _as_non_negative_int(settings.get("num_resets"), _DEFAULT_CONFIG["quest_settings"]["num_resets"]),
         "use_global_quests": bool(settings.get("use_global_quests", _DEFAULT_CONFIG["quest_settings"]["use_global_quests"])),
+        "enable_team_quests": bool(settings.get("enable_team_quests", _DEFAULT_CONFIG["quest_settings"]["enable_team_quests"])),
         "global_regular_quests": _as_string_list(settings.get("global_regular_quests")),
         "global_shiny_quests": _as_string_list(settings.get("global_shiny_quests")),
         "global_skin_quests": _as_string_list(settings.get("global_skin_quests")),
+        "team_quests_state": _as_team_quest_state_map(settings.get("team_quests_state")),
     }
 
 
@@ -276,6 +326,24 @@ def _normalized_contest_settings(config: Dict[str, Any]) -> Dict[str, Any]:
     default_choice = normalize_contest_leaderboard_id(settings.get("default_contest_leaderboard"))
     return {
         "default_contest_leaderboard": default_choice,
+        "ppe_aggregate_points_enabled": bool(
+            settings.get(
+                "ppe_aggregate_points_enabled",
+                _DEFAULT_CONFIG["contest_settings"]["ppe_aggregate_points_enabled"],
+            )
+        ),
+        "ppe_contest_include_quest_points": bool(
+            settings.get(
+                "ppe_contest_include_quest_points",
+                _DEFAULT_CONFIG["contest_settings"]["ppe_contest_include_quest_points"],
+            )
+        ),
+        "team_aggregate_points_enabled": bool(
+            settings.get(
+                "team_aggregate_points_enabled",
+                _DEFAULT_CONFIG["contest_settings"]["team_aggregate_points_enabled"],
+            )
+        ),
         "team_contest_include_quest_points": bool(
             settings.get(
                 "team_contest_include_quest_points",
@@ -291,6 +359,9 @@ def _normalized_contest_settings(config: Dict[str, Any]) -> Dict[str, Any]:
 def _normalized_points_settings(config: Dict[str, Any]) -> Dict[str, Any]:
     raw = config.get("points_settings", {}) if isinstance(config.get("points_settings", {}), dict) else {}
     raw_global = raw.get("global", {}) if isinstance(raw.get("global", {}), dict) else {}
+    raw_starting_penalty_modifiers = (
+        raw.get("starting_penalty_modifiers", {}) if isinstance(raw.get("starting_penalty_modifiers", {}), dict) else {}
+    )
 
     def _as_float(value: Any, fallback: float = 0.0) -> float:
         try:
@@ -304,6 +375,29 @@ def _normalized_points_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         "penalty_percent": _as_float(raw_global.get("penalty_percent"), _DEFAULT_CONFIG["points_settings"]["global"]["penalty_percent"]),
         "total_percent": _as_float(raw_global.get("total_percent"), _DEFAULT_CONFIG["points_settings"]["global"]["total_percent"]),
     }
+
+    raw_rarity_multipliers = raw.get("rarity_multipliers", {}) if isinstance(raw.get("rarity_multipliers", {}), dict) else {}
+    normalized_rarity_multipliers = {
+        "common": max(0.0, _as_float(raw_rarity_multipliers.get("common"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["common"])),
+        "uncommon": max(0.0, _as_float(raw_rarity_multipliers.get("uncommon"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["uncommon"])),
+        "rare": max(0.0, _as_float(raw_rarity_multipliers.get("rare"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["rare"])),
+        "legendary": max(0.0, _as_float(raw_rarity_multipliers.get("legendary"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["legendary"])),
+        "divine": max(0.0, _as_float(raw_rarity_multipliers.get("divine"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["divine"])),
+    }
+
+    normalized_starting_penalty_modifiers = {
+        "pet_level_percent_reduction": max(0.0, _as_float(raw_starting_penalty_modifiers.get("pet_level_percent_reduction"), 0.0)),
+        "exalts_percent_reduction": max(0.0, _as_float(raw_starting_penalty_modifiers.get("exalts_percent_reduction"), 0.0)),
+        "loot_percent_reduction": max(0.0, _as_float(raw_starting_penalty_modifiers.get("loot_percent_reduction"), 0.0)),
+        "incombat_percent_reduction": max(0.0, _as_float(raw_starting_penalty_modifiers.get("incombat_percent_reduction"), 0.0)),
+    }
+
+    duplicate_point_reduction = _as_float(
+        raw.get("duplicate_point_reduction"),
+        _DEFAULT_CONFIG["points_settings"]["duplicate_point_reduction"],
+    )
+    if duplicate_point_reduction < 0:
+        duplicate_point_reduction = _DEFAULT_CONFIG["points_settings"]["duplicate_point_reduction"]
 
     raw_penalty_weights = raw.get("penalty_weights", {}) if isinstance(raw.get("penalty_weights", {}), dict) else {}
 
@@ -349,11 +443,95 @@ def _normalized_points_settings(config: Dict[str, Any]) -> Dict[str, Any]:
                 "minimum_total": minimum_total,
             }
 
+    default_ut_points = max(
+        0.0,
+        _as_float(raw.get("default_ut_points"), _DEFAULT_CONFIG["points_settings"]["default_ut_points"]),
+    )
+    default_st_points = max(
+        0.0,
+        _as_float(raw.get("default_st_points"), _DEFAULT_CONFIG["points_settings"]["default_st_points"]),
+    )
+
+    raw_set_overrides = raw.get("set_overrides", {}) if isinstance(raw.get("set_overrides", {}), dict) else {}
+
+    normalized_set_overrides: Dict[str, Dict[str, float]] = {"UT": {}, "ST": {}}
+    for set_type in ("UT", "ST"):
+        type_bucket = raw_set_overrides.get(set_type, {}) if isinstance(raw_set_overrides.get(set_type, {}), dict) else {}
+        for set_name, points in type_bucket.items():
+            if not isinstance(set_name, str) or not set_name:
+                continue
+            parsed_points = _as_float(points, 0.0)
+            if parsed_points < 0:
+                continue
+            baseline = default_ut_points if set_type == "UT" else default_st_points
+            if parsed_points == baseline:
+                continue
+            normalized_set_overrides[set_type][set_name] = parsed_points
+
     return {
         "global": normalized_global,
+        "rarity_multipliers": normalized_rarity_multipliers,
+        "starting_penalty_modifiers": normalized_starting_penalty_modifiers,
+        "duplicate_point_reduction": duplicate_point_reduction,
         "penalty_weights": normalized_penalty_weights,
         "class_overrides": normalized_overrides,
+        "set_overrides": normalized_set_overrides,
+        "default_ut_points": default_ut_points,
+        "default_st_points": default_st_points,
     }
+
+
+def get_rarity_multipliers(guild_config: Dict[str, Any] | None) -> Dict[str, float]:
+    points_settings = guild_config.get("points_settings", {}) if isinstance(guild_config, dict) else {}
+    raw_multipliers = points_settings.get("rarity_multipliers", {}) if isinstance(points_settings.get("rarity_multipliers", {}), dict) else {}
+    defaults = _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]
+    result: Dict[str, float] = {}
+    for rarity, fallback in defaults.items():
+        try:
+            parsed = float(raw_multipliers.get(rarity, fallback))
+        except (TypeError, ValueError):
+            parsed = float(fallback)
+        result[rarity] = parsed if parsed >= 0 else float(fallback)
+    return result
+
+
+def get_set_bonuses(guild_config: Dict[str, Any] | None) -> Dict[str, Dict[str, float]]:
+    """Return effective set points map using defaults + explicit overrides."""
+    points_settings = guild_config.get("points_settings", {}) if isinstance(guild_config, dict) else {}
+    raw_overrides = points_settings.get("set_overrides", {}) if isinstance(points_settings.get("set_overrides", {}), dict) else {}
+
+    try:
+        default_ut = max(0.0, float(points_settings.get("default_ut_points", 0.0)))
+    except (TypeError, ValueError):
+        default_ut = 0.0
+    try:
+        default_st = max(0.0, float(points_settings.get("default_st_points", 0.0)))
+    except (TypeError, ValueError):
+        default_st = 0.0
+
+    from utils.set_operations import load_item_sets
+
+    all_sets = load_item_sets()
+    result: Dict[str, Dict[str, float]] = {"UT": {}, "ST": {}}
+    for set_name, set_data in all_sets.items():
+        set_type = str(set_data.get("type", "")).upper()
+        if set_type not in {"UT", "ST"}:
+            continue
+
+        base_points = default_ut if set_type == "UT" else default_st
+        points = base_points
+
+        type_overrides = raw_overrides.get(set_type, {}) if isinstance(raw_overrides.get(set_type, {}), dict) else {}
+        if set_name in type_overrides:
+            try:
+                parsed = float(type_overrides[set_name])
+                if parsed >= 0:
+                    points = parsed
+            except (TypeError, ValueError):
+                pass
+
+        result[set_type][set_name] = points
+    return result
 
 
 async def load_guild_config_by_id(guild_id: int) -> Dict[str, Any]:
@@ -534,6 +712,7 @@ async def update_global_points_modifiers(
     bonus_percent: float | None = None,
     penalty_percent: float | None = None,
     total_percent: float | None = None,
+    duplicate_point_reduction: float | None = None,
 ) -> Dict[str, Any]:
     settings = await get_points_settings(interaction)
     global_settings = dict(settings.get("global", {}))
@@ -546,8 +725,34 @@ async def update_global_points_modifiers(
         global_settings["penalty_percent"] = float(penalty_percent)
     if total_percent is not None:
         global_settings["total_percent"] = float(total_percent)
+    if duplicate_point_reduction is not None:
+        settings["duplicate_point_reduction"] = max(0.0, float(duplicate_point_reduction))
 
     settings["global"] = global_settings
+    return await set_points_settings(interaction, settings)
+
+
+async def update_starting_penalty_modifiers(
+    interaction: discord.Interaction,
+    *,
+    pet_level_percent_reduction: float | None = None,
+    exalts_percent_reduction: float | None = None,
+    loot_percent_reduction: float | None = None,
+    incombat_percent_reduction: float | None = None,
+) -> Dict[str, Any]:
+    settings = await get_points_settings(interaction)
+    modifier_settings = dict(settings.get("starting_penalty_modifiers", {}))
+
+    if pet_level_percent_reduction is not None:
+        modifier_settings["pet_level_percent_reduction"] = max(0.0, float(pet_level_percent_reduction))
+    if exalts_percent_reduction is not None:
+        modifier_settings["exalts_percent_reduction"] = max(0.0, float(exalts_percent_reduction))
+    if loot_percent_reduction is not None:
+        modifier_settings["loot_percent_reduction"] = max(0.0, float(loot_percent_reduction))
+    if incombat_percent_reduction is not None:
+        modifier_settings["incombat_percent_reduction"] = max(0.0, float(incombat_percent_reduction))
+
+    settings["starting_penalty_modifiers"] = modifier_settings
     return await set_points_settings(interaction, settings)
 
 

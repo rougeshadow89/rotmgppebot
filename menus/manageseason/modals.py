@@ -9,8 +9,12 @@ from menus.manageseason.services import (
     load_character_settings_for_menu,
     load_points_settings_for_menu,
     update_class_point_override,
+    update_duplicate_item_point_reduction,
     update_global_point_modifiers,
+    update_penalty_base_rates,
+    update_pet_point_modifiers,
     update_ppe_type_multipliers,
+    update_rarity_multipliers,
 )
 from menus.menu_utils import ConfirmCancelView
 
@@ -210,6 +214,311 @@ class EditGlobalPointSettingsModal(discord.ui.Modal, title="Edit Global Point Mo
             f"Bonus: {float(global_settings.get('bonus_percent', 0.0)):.2f}%\n"
             f"Penalty: {float(global_settings.get('penalty_percent', 0.0)):.2f}%\n"
             f"Total: {float(global_settings.get('total_percent', 0.0)):.2f}%\n"
+            f"PPEs recalculated: {refresh_summary.ppes_processed}\n"
+            f"PPE totals changed: {refresh_summary.ppes_updated}",
+            ephemeral=True,
+        )
+
+        await _refresh_point_settings_message(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            source_message=self.source_message,
+            settings=settings,
+            source_screen=self.source_screen,
+        )
+
+
+class EditPetModifierModal(discord.ui.Modal, title="Penalty Reduction Modifiers"):
+    pet_level_percent_reduction = discord.ui.TextInput(
+        label="Pet Level Reduction Rate (% per level)",
+        placeholder="Example: 0.1",
+        required=False,
+        max_length=20,
+    )
+    exalts_percent_reduction = discord.ui.TextInput(
+        label="Exalts Reduction Rate (% per exalt)",
+        placeholder="Example: 0.1",
+        required=False,
+        max_length=20,
+    )
+    loot_percent_reduction = discord.ui.TextInput(
+        label="Loot Boost Reduction Rate (% per 1% boost)",
+        placeholder="Example: 0.1",
+        required=False,
+        max_length=20,
+    )
+    incombat_percent_reduction = discord.ui.TextInput(
+        label="In-Combat Reduction Rate (% per 1.0s)",
+        placeholder="Example: 0.1",
+        required=False,
+        max_length=20,
+    )
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        settings: dict,
+        source_message: discord.Message | None,
+        source_screen: str = "landing",
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.source_message = source_message
+        self.source_screen = source_screen
+
+        modifiers = (
+            settings.get("starting_penalty_modifiers", {})
+            if isinstance(settings.get("starting_penalty_modifiers"), dict)
+            else {}
+        )
+        self.pet_level_percent_reduction.default = f"{float(modifiers.get('pet_level_percent_reduction', 0.0)):.2f}"
+        self.exalts_percent_reduction.default = f"{float(modifiers.get('exalts_percent_reduction', 0.0)):.2f}"
+        self.loot_percent_reduction.default = f"{float(modifiers.get('loot_percent_reduction', 0.0)):.2f}"
+        self.incombat_percent_reduction.default = f"{float(modifiers.get('incombat_percent_reduction', 0.0)):.2f}"
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu belongs to another user.", ephemeral=True)
+            return
+
+        try:
+            pet_level_percent_reduction = _parse_optional_float(
+                self.pet_level_percent_reduction.value,
+                field_name="pet_level_percent_reduction",
+            )
+            exalts_percent_reduction = _parse_optional_float(
+                self.exalts_percent_reduction.value,
+                field_name="exalts_percent_reduction",
+            )
+            loot_percent_reduction = _parse_optional_float(
+                self.loot_percent_reduction.value,
+                field_name="loot_percent_reduction",
+            )
+            incombat_percent_reduction = _parse_optional_float(
+                self.incombat_percent_reduction.value,
+                field_name="incombat_percent_reduction",
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        if all(
+            value is None
+            for value in (
+                pet_level_percent_reduction,
+                exalts_percent_reduction,
+                loot_percent_reduction,
+                incombat_percent_reduction,
+            )
+        ):
+            await interaction.response.send_message("ERROR: Provide at least one modifier to update.", ephemeral=True)
+            return
+
+        confirm_text = (
+            "⚠️ **Apply penalty reduction modifier changes and recalculate all PPE characters?**\n"
+            "These rates stack additively to reduce item points per starting stat unit.\n\n"
+            f"Pet Level Reduction: `{self.pet_level_percent_reduction.value or '(unchanged)'}`\n"
+            f"Exalts Reduction: `{self.exalts_percent_reduction.value or '(unchanged)'}`\n"
+            f"Loot Boost Reduction: `{self.loot_percent_reduction.value or '(unchanged)'}`\n"
+            f"In-Combat Reduction: `{self.incombat_percent_reduction.value or '(unchanged)'}`"
+        )
+        confirmed = await _confirm_points_update(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            confirmation_text=confirm_text,
+        )
+        if not confirmed:
+            return
+
+        settings, refresh_summary = await update_pet_point_modifiers(
+            interaction,
+            pet_level_percent_reduction=pet_level_percent_reduction,
+            exalts_percent_reduction=exalts_percent_reduction,
+            loot_percent_reduction=loot_percent_reduction,
+            incombat_percent_reduction=incombat_percent_reduction,
+        )
+
+        modifiers = settings.get("starting_penalty_modifiers", {})
+
+        await interaction.followup.send(
+            "Updated starting penalty reduction modifiers.\n"
+            f"Pet Level Reduction: {float(modifiers.get('pet_level_percent_reduction', 0.0)):.2f}%\n"
+            f"Exalts Reduction: {float(modifiers.get('exalts_percent_reduction', 0.0)):.2f}%\n"
+            f"Loot Boost Reduction: {float(modifiers.get('loot_percent_reduction', 0.0)):.2f}%\n"
+            f"In-Combat Reduction: {float(modifiers.get('incombat_percent_reduction', 0.0)):.2f}%\n"
+            f"PPEs recalculated: {refresh_summary.ppes_processed}\n"
+            f"PPE totals changed: {refresh_summary.ppes_updated}",
+            ephemeral=True,
+        )
+
+        await _refresh_point_settings_message(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            source_message=self.source_message,
+            settings=settings,
+            source_screen=self.source_screen,
+        )
+
+
+class EditPenaltyBaseRatesModal(discord.ui.Modal, title="Edit Penalty Base Rates"):
+    pet_points_per_level = discord.ui.TextInput(
+        label="Pet Level Rate (pts per level)",
+        placeholder="Example: -0.25",
+        required=False,
+        max_length=20,
+    )
+    exalts_points_per_exalt = discord.ui.TextInput(
+        label="Exalts Rate (pts per exalt)",
+        placeholder="Example: -0.50",
+        required=False,
+        max_length=20,
+    )
+    loot_points_per_percent = discord.ui.TextInput(
+        label="Loot Boost Rate (pts per 1% boost)",
+        placeholder="Example: -2.00",
+        required=False,
+        max_length=20,
+    )
+    incombat_points_per_second = discord.ui.TextInput(
+        label="In-Combat Rate (pts per 1.0s)",
+        placeholder="Example: -2.00",
+        required=False,
+        max_length=20,
+    )
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        settings: dict,
+        source_message: discord.Message | None,
+        source_screen: str = "landing",
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.source_message = source_message
+        self.source_screen = source_screen
+
+        weights = settings.get("penalty_weights", {}) if isinstance(settings.get("penalty_weights"), dict) else {}
+        try:
+            pet_level_per_point = float(weights.get("pet_level_per_point", 4.0))
+        except (TypeError, ValueError):
+            pet_level_per_point = 4.0
+        try:
+            exalts_per_point = float(weights.get("exalts_per_point", 2.0))
+        except (TypeError, ValueError):
+            exalts_per_point = 2.0
+        try:
+            loot_percent_per_point = float(weights.get("loot_percent_per_point", 0.5))
+        except (TypeError, ValueError):
+            loot_percent_per_point = 0.5
+        try:
+            incombat_seconds_per_point = float(weights.get("incombat_seconds_per_point", 0.1))
+        except (TypeError, ValueError):
+            incombat_seconds_per_point = 0.1
+
+        if pet_level_per_point <= 0:
+            pet_level_per_point = 4.0
+        if exalts_per_point <= 0:
+            exalts_per_point = 2.0
+        if loot_percent_per_point <= 0:
+            loot_percent_per_point = 0.5
+        if incombat_seconds_per_point <= 0:
+            incombat_seconds_per_point = 0.1
+
+        self.pet_points_per_level.default = f"{-1.0 / pet_level_per_point:.2f}"
+        self.exalts_points_per_exalt.default = f"{-1.0 / exalts_per_point:.2f}"
+        self.loot_points_per_percent.default = f"{-1.0 / loot_percent_per_point:.2f}"
+        self.incombat_points_per_second.default = f"{-1.0 / incombat_seconds_per_point:.2f}"
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu belongs to another user.", ephemeral=True)
+            return
+
+        try:
+            pet_points_per_level = _parse_optional_float(
+                self.pet_points_per_level.value,
+                field_name="pet_points_per_level",
+            )
+            exalts_points_per_exalt = _parse_optional_float(
+                self.exalts_points_per_exalt.value,
+                field_name="exalts_points_per_exalt",
+            )
+            loot_points_per_percent = _parse_optional_float(
+                self.loot_points_per_percent.value,
+                field_name="loot_points_per_percent",
+            )
+            incombat_points_per_second = _parse_optional_float(
+                self.incombat_points_per_second.value,
+                field_name="incombat_points_per_second",
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        if all(
+            value is None
+            for value in (
+                pet_points_per_level,
+                exalts_points_per_exalt,
+                loot_points_per_percent,
+                incombat_points_per_second,
+            )
+        ):
+            await interaction.response.send_message("ERROR: Provide at least one base rate to update.", ephemeral=True)
+            return
+
+        if pet_points_per_level is not None and abs(pet_points_per_level) <= 0:
+            await interaction.response.send_message("ERROR: Pet level rate must be non-zero.", ephemeral=True)
+            return
+        if exalts_points_per_exalt is not None and abs(exalts_points_per_exalt) <= 0:
+            await interaction.response.send_message("ERROR: Exalts rate must be non-zero.", ephemeral=True)
+            return
+        if loot_points_per_percent is not None and abs(loot_points_per_percent) <= 0:
+            await interaction.response.send_message("ERROR: Loot boost rate must be non-zero.", ephemeral=True)
+            return
+        if incombat_points_per_second is not None and abs(incombat_points_per_second) <= 0:
+            await interaction.response.send_message("ERROR: In-combat rate must be non-zero.", ephemeral=True)
+            return
+
+        confirm_text = (
+            "⚠️ **Apply penalty base-rate changes and recalculate all PPE characters?**\n"
+            "These rates define how starting penalty points are generated.\n\n"
+            f"Pet Level Rate: `{self.pet_points_per_level.value or '(unchanged)'}`\n"
+            f"Exalts Rate: `{self.exalts_points_per_exalt.value or '(unchanged)'}`\n"
+            f"Loot Boost Rate: `{self.loot_points_per_percent.value or '(unchanged)'}`\n"
+            f"In-Combat Rate: `{self.incombat_points_per_second.value or '(unchanged)'}`"
+        )
+        confirmed = await _confirm_points_update(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            confirmation_text=confirm_text,
+        )
+        if not confirmed:
+            return
+
+        settings, refresh_summary = await update_penalty_base_rates(
+            interaction,
+            pet_points_per_level=pet_points_per_level,
+            exalts_points_per_exalt=exalts_points_per_exalt,
+            loot_points_per_percent=loot_points_per_percent,
+            incombat_points_per_second=incombat_points_per_second,
+        )
+
+        weights = settings.get("penalty_weights", {}) if isinstance(settings.get("penalty_weights"), dict) else {}
+        pet_level_per_point = float(weights.get("pet_level_per_point", 4.0) or 4.0)
+        exalts_per_point = float(weights.get("exalts_per_point", 2.0) or 2.0)
+        loot_percent_per_point = float(weights.get("loot_percent_per_point", 0.5) or 0.5)
+        incombat_seconds_per_point = float(weights.get("incombat_seconds_per_point", 0.1) or 0.1)
+
+        await interaction.followup.send(
+            "Updated penalty base rates.\n"
+            f"Pet Level Rate: {-1.0 / pet_level_per_point:.2f} pts/level\n"
+            f"Exalts Rate: {-1.0 / exalts_per_point:.2f} pts/exalt\n"
+            f"Loot Boost Rate: {-1.0 / loot_percent_per_point:.2f} pts/1% boost\n"
+            f"In-Combat Rate: {-1.0 / incombat_seconds_per_point:.2f} pts/1.0s\n"
             f"PPEs recalculated: {refresh_summary.ppes_processed}\n"
             f"PPE totals changed: {refresh_summary.ppes_updated}",
             ephemeral=True,
@@ -430,4 +739,209 @@ class EditPpeTypeMultiplierModal(discord.ui.Modal):
             owner_id=self.owner_id,
             source_message=self.source_message,
             source_screen="ppe_type",
+        )
+
+
+class EditDuplicateItemPointsModal(discord.ui.Modal, title="Edit Duplicate Item Points"):
+    point_reduction = discord.ui.TextInput(
+        label="Point Reduction",
+        placeholder="Example: 0.5 (set 0 to disable duplicates)",
+        required=True,
+        max_length=20,
+    )
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        settings: dict,
+        source_message: discord.Message | None,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.source_message = source_message
+
+        raw_reduction = settings.get("duplicate_point_reduction", 0.5)
+        try:
+            parsed_reduction = float(raw_reduction)
+        except (TypeError, ValueError):
+            parsed_reduction = 0.5
+        if parsed_reduction < 0:
+            parsed_reduction = 0.5
+        self.point_reduction.default = f"{parsed_reduction:.2f}"
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu belongs to another user.", ephemeral=True)
+            return
+
+        try:
+            parsed = float(str(self.point_reduction.value).strip())
+        except ValueError:
+            await interaction.response.send_message("ERROR: Point Reduction must be a number.", ephemeral=True)
+            return
+
+        if parsed < 0:
+            await interaction.response.send_message("ERROR: Point Reduction must be 0 or greater.", ephemeral=True)
+            return
+
+        confirm_text = (
+            "⚠️ **Apply duplicate point reduction changes and recalculate all PPE characters?**\n"
+            "Set `0` to disable duplicate item points.\n\n"
+            f"Point Reduction: `{parsed:.2f}`"
+        )
+        confirmed = await _confirm_points_update(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            confirmation_text=confirm_text,
+        )
+        if not confirmed:
+            return
+
+        settings, refresh_summary = await update_duplicate_item_point_reduction(
+            interaction,
+            duplicate_point_reduction=parsed,
+        )
+
+        await interaction.followup.send(
+            "Updated duplicate item point reduction.\n"
+            f"Point Reduction: {float(settings.get('duplicate_point_reduction', parsed)):.2f}x\n"
+            "Set to 0 to disable duplicate item points.\n"
+            f"PPEs recalculated: {refresh_summary.ppes_processed}\n"
+            f"PPE totals changed: {refresh_summary.ppes_updated}",
+            ephemeral=True,
+        )
+
+        await _refresh_point_settings_message(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            source_message=self.source_message,
+            settings=settings,
+            source_screen="landing",
+        )
+
+
+class EditRarityModifiersModal(discord.ui.Modal, title="Edit Rarity Modifiers"):
+    common = discord.ui.TextInput(
+        label="Common Multiplier",
+        placeholder="Example: 1.0",
+        required=False,
+        max_length=20,
+    )
+    uncommon = discord.ui.TextInput(
+        label="Uncommon Multiplier",
+        placeholder="Example: 1.0",
+        required=False,
+        max_length=20,
+    )
+    rare = discord.ui.TextInput(
+        label="Rare Multiplier",
+        placeholder="Example: 1.0",
+        required=False,
+        max_length=20,
+    )
+    legendary = discord.ui.TextInput(
+        label="Legendary Multiplier",
+        placeholder="Example: 1.0",
+        required=False,
+        max_length=20,
+    )
+    divine = discord.ui.TextInput(
+        label="Divine Multiplier",
+        placeholder="Example: 2.0",
+        required=False,
+        max_length=20,
+    )
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        settings: dict,
+        source_message: discord.Message | None,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.source_message = source_message
+
+        rarity_multipliers = (
+            settings.get("rarity_multipliers", {})
+            if isinstance(settings.get("rarity_multipliers"), dict)
+            else {}
+        )
+        self.common.default = f"{float(rarity_multipliers.get('common', 1.0)):.2f}"
+        self.uncommon.default = f"{float(rarity_multipliers.get('uncommon', 1.0)):.2f}"
+        self.rare.default = f"{float(rarity_multipliers.get('rare', 1.0)):.2f}"
+        self.legendary.default = f"{float(rarity_multipliers.get('legendary', 1.0)):.2f}"
+        self.divine.default = f"{float(rarity_multipliers.get('divine', 2.0)):.2f}"
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu belongs to another user.", ephemeral=True)
+            return
+
+        try:
+            common = _parse_optional_float(self.common.value, field_name="common")
+            uncommon = _parse_optional_float(self.uncommon.value, field_name="uncommon")
+            rare = _parse_optional_float(self.rare.value, field_name="rare")
+            legendary = _parse_optional_float(self.legendary.value, field_name="legendary")
+            divine = _parse_optional_float(self.divine.value, field_name="divine")
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        if all(value is None for value in (common, uncommon, rare, legendary, divine)):
+            await interaction.response.send_message("ERROR: Provide at least one rarity multiplier to update.", ephemeral=True)
+            return
+
+        for value in (common, uncommon, rare, legendary, divine):
+            if value is not None and value < 0:
+                await interaction.response.send_message("ERROR: Rarity multipliers must be 0 or greater.", ephemeral=True)
+                return
+
+        confirm_text = (
+            "⚠️ **Apply rarity modifier changes and recalculate all PPE characters?**\n"
+            "These multipliers affect item points by rarity.\n\n"
+            f"Common: `{self.common.value or '(unchanged)'}`\n"
+            f"Uncommon: `{self.uncommon.value or '(unchanged)'}`\n"
+            f"Rare: `{self.rare.value or '(unchanged)'}`\n"
+            f"Legendary: `{self.legendary.value or '(unchanged)'}`\n"
+            f"Divine: `{self.divine.value or '(unchanged)'}`"
+        )
+        confirmed = await _confirm_points_update(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            confirmation_text=confirm_text,
+        )
+        if not confirmed:
+            return
+
+        settings, refresh_summary = await update_rarity_multipliers(
+            interaction,
+            common=common,
+            uncommon=uncommon,
+            rare=rare,
+            legendary=legendary,
+            divine=divine,
+        )
+        multipliers = settings.get("rarity_multipliers", {}) if isinstance(settings.get("rarity_multipliers"), dict) else {}
+
+        await interaction.followup.send(
+            "Updated rarity modifiers.\n"
+            f"Common: {float(multipliers.get('common', 1.0)):.2f}x\n"
+            f"Uncommon: {float(multipliers.get('uncommon', 1.0)):.2f}x\n"
+            f"Rare: {float(multipliers.get('rare', 1.0)):.2f}x\n"
+            f"Legendary: {float(multipliers.get('legendary', 1.0)):.2f}x\n"
+            f"Divine: {float(multipliers.get('divine', 2.0)):.2f}x\n"
+            f"PPEs recalculated: {refresh_summary.ppes_processed}\n"
+            f"PPE totals changed: {refresh_summary.ppes_updated}",
+            ephemeral=True,
+        )
+
+        await _refresh_point_settings_message(
+            interaction=interaction,
+            owner_id=self.owner_id,
+            source_message=self.source_message,
+            settings=settings,
+            source_screen="landing",
         )

@@ -4,6 +4,8 @@ from utils.guild_config import load_guild_config
 from utils.calc_points import load_loot_points, normalize_item_name
 from utils.pagination import chunk_lines_to_pages
 from utils.points_service import recompute_ppe_points
+from utils.season_loot_history import delete_season_item_all_rarities, season_unique_items
+from utils.loot_constants import normalize_rarity
 
 async def command(interaction: discord.Interaction):
     if not interaction.guild:
@@ -30,7 +32,7 @@ async def command(interaction: discord.Interaction):
         if not player_data.ppes:
             # Still clean invalid season cache entries even if player has no PPEs.
             invalid_unique_items = []
-            for item_name, shiny in list(player_data.unique_items):
+            for item_name, shiny in list(season_unique_items(player_data)):
                 lookup_name = f"{normalize_item_name(item_name)} (shiny)" if shiny else normalize_item_name(item_name)
                 if lookup_name not in loot_points:
                     invalid_unique_items.append((item_name, shiny))
@@ -44,7 +46,7 @@ async def command(interaction: discord.Interaction):
 
                 removed_unique_items_by_player.setdefault(player_name, [])
                 for item_name, shiny in invalid_unique_items:
-                    player_data.unique_items.discard((item_name, shiny))
+                    delete_season_item_all_rarities(player_data, item_name=item_name, shiny=shiny)
                     item_label = f"{item_name}{' (shiny)' if shiny else ''}"
                     removed_unique_items_by_player[player_name].append(item_label)
             continue
@@ -73,7 +75,11 @@ async def command(interaction: discord.Interaction):
                     except:
                         player_name = f"User {player_key}"
 
-                    item_label = f"{loot_item.item_name}{' (shiny)' if loot_item.shiny else ''}{' (divine)' if loot_item.divine else ''}"
+                    item_label = (
+                        f"{loot_item.item_name}"
+                        f"{' (shiny)' if loot_item.shiny else ''}"
+                        f"{' (divine)' if normalize_rarity(getattr(loot_item, 'rarity', 'common')) == 'divine' else ''}"
+                    )
                     player_summary = removed_items_by_player.setdefault(player_name, {})
                     item_summary = player_summary.setdefault(
                         item_label,
@@ -112,7 +118,7 @@ async def command(interaction: discord.Interaction):
 
         # Clean invalid season cache entries for this player as well.
         invalid_unique_items = []
-        for item_name, shiny in list(player_data.unique_items):
+        for item_name, shiny in list(season_unique_items(player_data)):
             lookup_name = f"{normalize_item_name(item_name)} (shiny)" if shiny else normalize_item_name(item_name)
             if lookup_name not in loot_points:
                 invalid_unique_items.append((item_name, shiny))
@@ -126,7 +132,7 @@ async def command(interaction: discord.Interaction):
 
             removed_unique_items_by_player.setdefault(player_name, [])
             for item_name, shiny in invalid_unique_items:
-                player_data.unique_items.discard((item_name, shiny))
+                delete_season_item_all_rarities(player_data, item_name=item_name, shiny=shiny)
                 item_label = f"{item_name}{' (shiny)' if shiny else ''}"
                 removed_unique_items_by_player[player_name].append(item_label)
     

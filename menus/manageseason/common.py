@@ -51,6 +51,48 @@ def _build_ppe_type_multiplier_lines(multipliers: dict) -> list[str]:
     return lines
 
 
+def _build_starting_penalty_modifier_lines(modifiers: dict) -> list[str]:
+    return [
+        f"• Pet Level Reduction Rate: {_format_percent(modifiers.get('pet_level_percent_reduction', 0.0))} per level",
+        f"• Exalts Reduction Rate: {_format_percent(modifiers.get('exalts_percent_reduction', 0.0))} per exalt",
+        f"• Loot Boost Reduction Rate: {_format_percent(modifiers.get('loot_percent_reduction', 0.0))} per 1% boost",
+        f"• In-Combat Reduction Rate: {_format_percent(modifiers.get('incombat_percent_reduction', 0.0))} per 1.0s",
+    ]
+
+
+def _build_rarity_multiplier_lines(rarity_multipliers: dict) -> list[str]:
+    lines: list[str] = []
+    for rarity in ("common", "uncommon", "rare", "legendary", "divine"):
+        value = 1.0
+        try:
+            value = float(rarity_multipliers.get(rarity, 1.0))
+        except (TypeError, ValueError):
+            value = 1.0
+        lines.append(f"• {rarity.title()}: **{value:.2f}x**")
+    return lines
+
+
+def _safe_positive_float(value: object, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _build_penalty_rate_lines(penalty_weights: dict) -> list[str]:
+    pet_level_per_point = _safe_positive_float(penalty_weights.get("pet_level_per_point"), 4.0)
+    exalts_per_point = _safe_positive_float(penalty_weights.get("exalts_per_point"), 2.0)
+    loot_percent_per_point = _safe_positive_float(penalty_weights.get("loot_percent_per_point"), 0.5)
+    incombat_seconds_per_point = _safe_positive_float(penalty_weights.get("incombat_seconds_per_point"), 0.1)
+    return [
+        f"• Pet Level: **{-1.0 / pet_level_per_point:.2f}** pts per level",
+        f"• Exalts: **{-1.0 / exalts_per_point:.2f}** pts per exalt",
+        f"• Loot Boost: **{-1.0 / loot_percent_per_point:.2f}** pts per 1% boost",
+        f"• In-Combat Reduction: **{-0.2 / incombat_seconds_per_point:.2f}** pts per 0.2 seconds",
+    ]
+
+
 def build_manageseason_home_embed() -> discord.Embed:
     """Build the top-level /manageseason embed with action guidance."""
     embed = discord.Embed(
@@ -64,15 +106,15 @@ def build_manageseason_home_embed() -> discord.Embed:
     embed.add_field(
         name="Reset Season",
         value=(
-            "Clears all PPE characters, season uniques, quest progress, and teams.\n"
-            "This action requires **Discord Administrator** permission and always asks for confirmation."
+            "Open granular season reset actions and choose exactly what to reset.\n"
+            "Each reset action requires **Discord Administrator** permission and always asks for confirmation."
         ),
         inline=False,
     )
     embed.add_field(
         name="Manage Point Settings",
         value=(
-            "Open point modifier menus to review and edit global or class-specific percentage modifiers."
+            "Open point modifier menus to review and edit global, pet, or class-specific percentage modifiers."
         ),
         inline=False,
     )
@@ -97,6 +139,13 @@ def build_manageseason_home_embed() -> discord.Embed:
         ),
         inline=False,
     )
+    embed.add_field(
+        name="Factory Reset Settings",
+        value=(
+            "Quick reset for admin-tunable settings only. Preserves sniffer endpoint and join embed references."
+        ),
+        inline=False,
+    )
     embed.set_footer(text="This menu is owner-bound: only the admin who opened it can use the controls.")
     return embed
 
@@ -105,6 +154,9 @@ def build_manage_contests_embed(settings: dict) -> discord.Embed:
     """Build the Manage Contests home embed."""
     default_choice = settings.get("default_contest_leaderboard")
     default_label = contest_leaderboard_label(default_choice)
+    ppe_aggregate_enabled = bool(settings.get("ppe_aggregate_points_enabled", False))
+    team_aggregate_enabled = bool(settings.get("team_aggregate_points_enabled", False))
+    ppe_quest_enabled = bool(settings.get("ppe_contest_include_quest_points", False))
     team_quest_enabled = bool(settings.get("team_contest_include_quest_points", False))
     join_channel_id = int(settings.get("join_contest_channel_id", 0) or 0)
     join_message_id = int(settings.get("join_contest_message_id", 0) or 0)
@@ -133,6 +185,9 @@ def build_manage_contests_embed(settings: dict) -> discord.Embed:
         name="Manage Leaderboards",
         value=(
             "Open contest leaderboard scoring controls.\n"
+            f"PPE aggregate points: **{'Enabled' if ppe_aggregate_enabled else 'Disabled'}**\n"
+            f"Team aggregate points: **{'Enabled' if team_aggregate_enabled else 'Disabled'}**\n"
+            f"PPE contest quest scoring: **{'Enabled' if ppe_quest_enabled else 'Disabled'}**\n"
             f"Team contest quest scoring: **{'Enabled' if team_quest_enabled else 'Disabled'}**"
         ),
         inline=False,
@@ -210,19 +265,50 @@ def build_set_contest_type_embed(settings: dict) -> discord.Embed:
 
 def build_leaderboard_manager_embed(settings: dict) -> discord.Embed:
     """Build the leaderboard manager embed."""
+    ppe_aggregate_enabled = bool(settings.get("ppe_aggregate_points_enabled", False))
+    ppe_quest_enabled = bool(settings.get("ppe_contest_include_quest_points", False))
+    team_aggregate_enabled = bool(settings.get("team_aggregate_points_enabled", False))
     team_quest_enabled = bool(settings.get("team_contest_include_quest_points", False))
-    status_text = "Enabled" if team_quest_enabled else "Disabled"
 
     embed = discord.Embed(
         title="Leaderboard Manager",
-        description="Configure how points are calculated for team contests.",
+        description="Configure how points are calculated for contest leaderboards.",
         color=discord.Color.dark_magenta(),
+    )
+    embed.add_field(
+        name="PPE Aggregate Points",
+        value=(
+            f"Current status: **{'Enabled' if ppe_aggregate_enabled else 'Disabled'}**\n"
+            "When enabled, each player's PPE leaderboard score adds all of their PPE characters together.\n"
+            "When disabled, PPE leaderboard score uses only that player's best PPE."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="PPE Contest Quest Scoring",
+        value=(
+            f"Current status: **{'Enabled' if ppe_quest_enabled else 'Disabled'}**\n"
+            "When enabled, completed quests add to PPE leaderboard totals.\n"
+            "If team shared quests are enabled, each team member receives their team shared quest total.\n"
+            "Works with aggregate mode: all PPE points + quest points are combined."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Team Aggregate Points",
+        value=(
+            f"Current status: **{'Enabled' if team_aggregate_enabled else 'Disabled'}**\n"
+            "When enabled, team leaderboard score adds every character on every member.\n"
+            "When disabled, team leaderboard score uses each member's best PPE."
+        ),
+        inline=False,
     )
     embed.add_field(
         name="Team Contest Quest Scoring",
         value=(
-            f"Current status: **{status_text}**\n"
+            f"Current status: **{'Enabled' if team_quest_enabled else 'Disabled'}**\n"
             "When enabled, completed quests add points to team totals.\n"
+            "If team shared quests are enabled, shared quest points are counted once per team.\n"
             "When disabled, team totals use PPE points only."
         ),
         inline=False,
@@ -263,22 +349,38 @@ def build_point_settings_embed(settings: dict) -> discord.Embed:
     """Build the point-settings landing embed."""
     global_settings = settings.get("global", {}) if isinstance(settings.get("global"), dict) else {}
     class_overrides = settings.get("class_overrides", {}) if isinstance(settings.get("class_overrides"), dict) else {}
+    penalty_weights = settings.get("penalty_weights", {}) if isinstance(settings.get("penalty_weights"), dict) else {}
+    starting_penalty_modifiers = (
+        settings.get("starting_penalty_modifiers", {})
+        if isinstance(settings.get("starting_penalty_modifiers"), dict)
+        else {}
+    )
+    rarity_multipliers = (
+        settings.get("rarity_multipliers", {})
+        if isinstance(settings.get("rarity_multipliers"), dict)
+        else {}
+    )
+    try:
+        duplicate_reduction = float(settings.get("duplicate_point_reduction", 0.5))
+    except (TypeError, ValueError):
+        duplicate_reduction = 0.5
+    if duplicate_reduction < 0:
+        duplicate_reduction = 0.5
 
     embed = discord.Embed(
         title="Manage Point Settings",
         description=(
-            "Choose which modifier group to manage.\n"
-            "Each submenu explains exactly how modifiers affect final points."
+            "Point controls are split into global/class modifiers, starting-penalty tuning, and duplicate/type scaling."
         ),
         color=discord.Color.dark_teal(),
     )
     embed.add_field(
-        name="Global Snapshot",
+        name="Global Modifiers",
         value=(
-            f"Loot: **{_format_percent(global_settings.get('loot_percent', 0.0))}**\n"
-            f"Bonus: **{_format_percent(global_settings.get('bonus_percent', 0.0))}**\n"
-            f"Penalty: **{_format_percent(global_settings.get('penalty_percent', 0.0))}**\n"
-            f"Total: **{_format_percent(global_settings.get('total_percent', 0.0))}**"
+            f"• Loot: **{_format_percent(global_settings.get('loot_percent', 0.0))}**\n"
+            f"• Bonus: **{_format_percent(global_settings.get('bonus_percent', 0.0))}**\n"
+            f"• Penalty: **{_format_percent(global_settings.get('penalty_percent', 0.0))}**\n"
+            f"• Total: **{_format_percent(global_settings.get('total_percent', 0.0))}**"
         ),
         inline=False,
     )
@@ -288,13 +390,38 @@ def build_point_settings_embed(settings: dict) -> discord.Embed:
         preview = "\n".join(override_lines[:6])
         if len(override_lines) > 6:
             preview += f"\n... and {len(override_lines) - 6} more"
-    embed.add_field(name="Class Override Snapshot", value=_truncate_field_value(preview), inline=False)
+    embed.add_field(name="Class Overrides", value=_truncate_field_value(preview), inline=False)
     embed.add_field(
-        name="PPE Type Multipliers",
-        value="Use **Edit PPE Type Points** to manage per-type point multipliers.",
+        name="Penalty Base Rates",
+        value="\n".join(_build_penalty_rate_lines(penalty_weights)),
         inline=False,
     )
-    embed.set_footer(text="Use Edit Global Modifiers or Edit Class Modifiers to continue.")
+    embed.add_field(
+        name="Penalty Reduction Modifiers",
+        value=("\n".join(_build_starting_penalty_modifier_lines(starting_penalty_modifiers))
+               + "\n• Reductions stack additively per starting stat."),
+        inline=False,
+    )
+    embed.add_field(
+        name="Duplicate Item Points",
+        value=(
+            f"• Point Reduction: **{duplicate_reduction:.2f}x**\n"
+            "• Applies to every duplicate copy after the first.\n"
+            "• Set `0` to disable duplicate points"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Rarity Modifiers",
+        value="\n".join(_build_rarity_multiplier_lines(rarity_multipliers)),
+        inline=False,
+    )
+    embed.add_field(
+        name="PPE Type Multipliers",
+        value="Use **Edit PPE Type Points** to manage final-score multipliers per PPE type.",
+        inline=False,
+    )
+    embed.set_footer(text="Any points-setting change triggers a full PPE points recalculation.")
     return embed
 
 

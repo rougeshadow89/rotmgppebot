@@ -7,7 +7,8 @@ A comprehensive Discord bot for managing competitions and more in Realm of the M
 ### Player Features
 - **Create & Manage PPEs**: Create PPEs with automatic penalty calculations.
 - **Season Management**: Track whole season loot, beyond individual characters. Auto-updated with character loot.
-- **Account Quests**: Get item, shiny, and skin quests with automated completion tracking via `/myquests`.
+- **Item Sets**: Complete item sets automatically to earn bonus points and receive congratulations messages. Track completed sets per PPE.
+- **Account Quests**: Get item, shiny, and skin quests with automated completion tracking via `/myquests`, including board views for active and completed quest sets.
 - **Team Functionality**: You can be added to a team and be assigned a team-specific role with points automatically counted together.
 - **Loot Tracking**: Track and graphically view regular, shiny, and divine items and skins automatically or manually.
 - **Sniffer Integration**: Automatically connect in-game characters to your bot account via sniffer for automated logging.
@@ -17,7 +18,8 @@ A comprehensive Discord bot for managing competitions and more in Realm of the M
 
 ### Admin Features
 - **Player Management**: One central dashboard for managing any player via `/manageplayer`.
-- **Quest Management**: View and reset quest progress for any contest player, including setting up global, shared quests via `/managequests`.
+- **Quest Management**: View and reset quest progress for any contest player, configure quest mode (Global vs Team Shared), and manage global quest pools via `/managequests`.
+- **Set Completion Configuration**: Configure bonus points for completed item sets (separate for ST and UT) via `/manageseason` -> `Manage Point Settings`.
 - **Team Management**: Use `/manageteams` to create, update, and delete teams; assign members through `/manageplayer`
 - **Global Season Management**: Manage the overall season and the nitty gritty details of how the bot works with `/manageseason`. *Note: this board is still a work in-progress.*
 
@@ -220,6 +222,7 @@ If you don't want to set up the Sniffer, you can easily enable text-based image 
 | Command | Description |
 |---------|-------------|
 | `/addplayer` | Register a player for the contest |
+| `/addadmin` | Grant PPE Admin role to a member (server owner only) |
 | `/listplayers` | View all contest participants |
 | `/manageplayer` | Open the admin menu to manage a player's PPE, season loot, quests, team state, and roles (owner-only buttons for Make/Remove Admin) |
 | `/addlootfor` | Add items to any player's specific PPE |
@@ -229,17 +232,25 @@ If you don't want to set up the Sniffer, you can easily enable text-based image 
 | `/addpointsfor` | Manually add points to a specific PPE |
 | `/refreshpointsfor` | Recalculate points for a specific PPE |
 | `/refreshallpoints` | Fix all PPE point totals server-wide |
-| `/managequests` | View or update per-server quest targets (regular/shiny/skin), global quest pools, and run Reset All Quests from the menu |
-| `/manageseason` | Open season admin controls: Reset Season and Manage Point Settings |
+| `/managequests` | View or update per-server quest targets (regular/shiny/skin), manage quest mode (Global/Team Shared), edit global quest pools, and run Reset All Quests from the menu |
+| `/manageseason` | Open season admin controls: step-by-step Reset Season, contests, picture suggestions, and point settings |
+| `/forcereset` | Emergency full data wipe for this guild (server owner only); use when you need a complete restart |
 | `/addseasonlootfor` | Add a unique item to another player's season collection |
 | `/removeseasonlootfrom` | Remove a unique item from another player's season collection |
 
 Legacy standalone commands for `/myloot`, `/myppes`, and `/showseasonloot` were retired in favor of `/myinfo`.
 The `/myquests` command and the My Info -> Show Quests button now use the same shared menu view implementation.
+When Team Shared Quests are disabled, each member's personal completed quests are rebuilt from team-completed quests they personally own in seasonal loot.
 Quest reset actions are now menu-integrated:
 - Use `/myquests` -> `Reset Quests` for self resets.
 - Use `/manageplayer` -> `Show Quests` -> `Reset Quests` for admin resets.
 - Use `/managequests` -> `Reset All Quests` for server-wide quest resets.
+
+Season reset and recovery flow:
+- Use `/manageseason` -> `Reset Season` for the guided multi-step reset flow (each action has its own confirmation).
+- Use `/manageseason` -> `Reset Season` -> `Reset Sniffer Information` to selectively clear sniffer data.
+- Use `/manageseason` -> `Manage Point Settings` -> `Edit Duplicate Item Points` to set duplicate scoring reduction (set Point Reduction to `0` to disable duplicate points).
+- Use `/forcereset` only as an emergency full wipe when you want to delete all stored bot data for the guild and restart setup.
 
 ### Team Commands
 | Command | Description |
@@ -291,7 +302,7 @@ PlayerData
 ├── is_member: bool
 ├── active_ppe: int
 ├── team_name: str (optional)  # Name of team player is on
-├── unique_items: Set[tuple]  # (item_name, shiny) - Seasonal
+├── season_item_history: Dict[str, List[int]]  # season item variant key -> sorted timestamps
 ├── quests: QuestData
 │   ├── current_items: List[str]
 │   ├── current_shinies: List[str]
@@ -303,6 +314,7 @@ PlayerData
     ├── id: int
     ├── name: ROTMGClass
     ├── points: float
+    ├── completed_sets: List[str]  # Names of completed item sets
     ├── loot: List[Loot]
     │   ├── item_name: str
     │   ├── quantity: int
@@ -313,6 +325,9 @@ PlayerData
         ├── points: float
         ├── repeatable: bool
         └── quantity: int
+
+Seasonal ownership, rarity spread, and time-based summaries are derived from `season_item_history` at read time.
+When loot rarity is missing or `None`, it is treated as `common`.
 
 TeamData
 ├── name: str          # Team name
@@ -325,7 +340,7 @@ TeamData
 ### Data Files
 - `rotmg_loot_drops_updated.csv`: Item point values
 - `bonuses.csv`: Available achievement bonuses
-- `{guild_id}_loot_records.json`: Player data storage (per guild)
+- `{guild_id}_{user_id}_loot_records.json`: Player data storage (one file per player)
 - `{guild_id}_teams.json`: Team data storage (per guild)
 - `{guild_id}_config.json`: Per-server settings storage (quest target counts and future config)
 - `{guild_id}_{user_id}_realmshark_pending.json`: Pending unmapped character logs for each player
@@ -343,7 +358,8 @@ TeamData
 
 ### Duplicate Handling
 - **First item**: Full point value
-- **Additional copies**: Half points (except 1-point items)
+- **Additional copies**: Base value multiplied by the configurable Point Reduction setting (default `0.5`)
+- **Disable duplicates**: Set Point Reduction to `0` in `/manageseason` -> `Manage Point Settings` -> `Edit Duplicate Item Points`
 - **Removal**: Correctly calculates which points to subtract
 
 ### Penalties
@@ -351,7 +367,13 @@ TeamData
 - **Exalts**: -0.5 points per exalt
 - **Loot Boost**: -2 points per 1% boost
 - **In-Combat Reduction**: -10 points per 0.2 seconds
-
+### Set Completion Bonuses
+- **What Are Sets**: Item sets are collections of 4 special items (Weapon, Ability, Armor, Ring). When you collect all 4 items from a set, you complete the set.
+- **Auto-Detection**: The bot automatically detects when a set is completed as soon as you log the final item via `/addloot`, sniffer, or `/submitloot`.
+- **Congratulations Message**: When a set is completed, a public congratulation message is posted to the channel.
+- **Point Rewards**: Each completed set grants configurable bonus points (default: 0). Admins can set different points for ST (Standard) and UT (Unique) sets via `/manageseason` -> `Manage Point Settings` -> `Manage Set Completion Points`.
+- **One-Time Per PPE**: You only get the bonus once per set per PPE. Completing the same set on a different PPE grants the bonus again.
+- **Configuration**: Admins can manage set bonus points through the interactive menu, with separate sections for ST and UT sets. Use the form to set points per set (e.g., `Golden Archer Set=50`) or reset all to 0.
 ## � Team System
 
 ### Overview
@@ -396,8 +418,6 @@ rotmgppebot/
 ├── menus/                    # Shared menu/view architecture
 │   ├── myinfo/               # My Info menu package (home/season/character/common)
 │   ├── myquests/             # My Quests menu package (view/common)
-│   ├── myinfo_menu.py        # Compatibility wrapper for older imports
-│   ├── myquests_menu.py      # Compatibility wrapper for older imports
 │   └── menu_utils/           # Reusable owner/confirm menu components
 ├── slash_commands/           # Command implementations
 ├── utils/                   # Utility modules
