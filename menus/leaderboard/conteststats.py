@@ -94,7 +94,6 @@ async def command(interaction: discord.Interaction) -> None:
 
         total_characters = 0
         total_points = 0.0
-        total_unique_season = 0
         total_completed_quests = 0
 
         for user_id, data in members:
@@ -172,7 +171,6 @@ async def command(interaction: discord.Interaction) -> None:
             )
 
             total_characters += player_character_count
-            total_points += player_points
             total_unique_season += player_unique_season
             total_completed_quests += completed_total
 
